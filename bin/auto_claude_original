@@ -1,0 +1,1664 @@
+#!/bin/bash
+# auto_claude — Reusable autonomous feature pipeline
+#
+# A generic pipeline engine that sources project-specific configuration
+# from .auto_claude.conf in the project root. All infrastructure (logging,
+# Claude invocation, structured state, test-fix loop, phase sequencing)
+# lives here. Project-specific content (test commands, review criteria,
+# prompt fragments) lives in the conf.
+#
+# Usage: auto_claude <path-to-spec.md>
+#
+# Requires: .auto_claude.conf in the git root with at least one test_suite_*() function.
+#
+# Architecture: The pipeline splits into two blocks at a configurable seam:
+#
+#   Authoring block (plan → implement → test_fix → ci_checks):
+#     Single Claude conversation via --continue. Full context for accurate
+#     implementation and debugging. ci_checks auto-fixes formatting/lint and
+#     sends type errors to Claude while it still has full context.
+#
+#   Quality block (skill_chain → loc_enforcement → fresh_review → doc_update → final):
+#     Each phase gets a fresh Claude session with a tailored context pack
+#     assembled from structured state. Sequential — each feeds into the next.
+#
+# Structured state (.auto_claude_state.json) replaces the old checkpoint,
+# transcript, and baseline files with a single inspectable JSON file.
+
+set -Eeuo pipefail
+trap 'rc=$?; log ERROR "Pipeline failed at line $LINENO (exit $rc)"; exit 1' ERR
+
+# Force CI mode so test runners (vitest, jest, etc.) run non-interactively.
+# Without this, vitest detects the TTY and enters watch mode, hanging the pipeline.
+export CI=true
+
+# Ctrl+C should kill the whole process tree, not hang inside a subshell.
+# Without this, claude running inside a subshell swallows SIGINT and the user
+# has to close the terminal window to escape.
+# NOTE: These traps are replaced by _acquire_lock() with lock-aware versions.
+# They exist here only for the pre-lock startup phase.
+trap 'echo ""; log WARN "Interrupted by user"; kill 0 2>/dev/null; exit 130' INT TERM
+
+# Verify jq is available (used for JSON parsing of claude output and state file)
+if ! command -v jq &>/dev/null; then
+  echo "ERROR: jq is required but not found. Install with: brew install jq" >&2
+  exit 1
+fi
+
+# ─── Configuration Defaults ──────────────────────────────────────────────────
+# All overridable in .auto_claude.conf
+
+MAX_TEST_ITERATIONS=5
+MAX_REFACTOR_ROUNDS=10
+MAX_LOC=300
+MAX_CI_ITERATIONS=3
+PHASES=(plan implement test_fix ci_checks skill_chain loc_enforcement fresh_review doc_update final)
+
+# The last phase in the authoring block. Extraction happens after this phase
+# and all subsequent phases get fresh sessions with structured context packs.
+SEAM_AFTER="ci_checks"
+
+# Prompt fragment variables — injected into generic phase prompts.
+# Set these in .auto_claude.conf to add project-specific context.
+PLAN_CONTEXT=""
+REVIEW_EXTRAS=""
+SECURITY_EXTRAS=""
+FRESH_REVIEW_PREAMBLE=""
+FRESH_REVIEW_EXTRAS=""
+DOC_UPDATE_CONTEXT=""
+
+# ─── Auto-detect Project Root ────────────────────────────────────────────────
+# Tries git first (works from any subdirectory, handles symlinks). If not in a
+# git repo, walks up from pwd looking for .auto_claude.conf — because that file
+# must exist for the pipeline to run, it doubles as a reliable project marker.
+
+HAS_GIT=false
+if PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  HAS_GIT=true
+else
+  # Walk up from pwd looking for .auto_claude.conf
+  _dir="$(pwd)"
+  while [ "$_dir" != "/" ]; do
+    if [ -f "${_dir}/.auto_claude.conf" ]; then
+      PROJECT_ROOT="$_dir"
+      break
+    fi
+    _dir="$(dirname "$_dir")"
+  done
+  unset _dir
+
+  if [ -z "${PROJECT_ROOT:-}" ]; then
+    echo "ERROR: Could not detect project root." >&2
+    echo "Either run from inside a git repo, or ensure .auto_claude.conf exists in an ancestor directory." >&2
+    exit 1
+  fi
+fi
+PROJECT_NAME="$(basename "$PROJECT_ROOT")"
+
+# ─── Arguments ───────────────────────────────────────────────────────────────
+
+SPEC_FILE="${1:?Usage: auto_claude <path-to-spec.md>}"
+# Resolve to absolute path so cd's in test suites don't break the reference
+if [[ "$SPEC_FILE" != /* ]]; then
+  SPEC_FILE="$(pwd)/$SPEC_FILE"
+fi
+
+# ─── Runtime Paths ───────────────────────────────────────────────────────────
+
+LOG_FILE="${PROJECT_ROOT}/.auto_claude_$(date +%Y%m%d_%H%M%S).log"
+STATE_FILE="${PROJECT_ROOT}/.auto_claude_state.json"
+BASELINE_FILE="${PROJECT_ROOT}/.auto_claude_baseline"
+LOCK_FILE="${PROJECT_ROOT}/.auto_claude.lock"
+
+# ─── Concurrency Guard ─────────────────────────────────────────────────────
+# Only one auto_claude instance may run per project. A second instance on the
+# same repo would corrupt the shared state file and collide on --continue.
+# Uses mkdir (atomic on all filesystems) instead of flock (not on macOS).
+
+_acquire_lock() {
+  if mkdir "$LOCK_FILE" 2>/dev/null; then
+    # Write PID so stale locks can be diagnosed
+    echo "$$" > "$LOCK_FILE/pid"
+    # Clean up lock on any exit (normal, error, signal)
+    trap 'rc=$?; _release_lock; log ERROR "Pipeline failed at line $LINENO (exit $rc)"; exit 1' ERR
+    trap '_release_lock; echo ""; log WARN "Interrupted by user"; kill 0 2>/dev/null; exit 130' INT TERM
+    trap '_release_lock' EXIT
+    return 0
+  fi
+
+  # Lock exists — check if the holding process is still alive
+  local holder_pid=""
+  if [ -f "$LOCK_FILE/pid" ]; then
+    holder_pid=$(<"$LOCK_FILE/pid")
+  fi
+
+  if [ -n "$holder_pid" ] && kill -0 "$holder_pid" 2>/dev/null; then
+    echo "ERROR: Another auto_claude is running (PID $holder_pid)." >&2
+    echo "       If this is stale, remove: rm -rf $LOCK_FILE" >&2
+    exit 1
+  else
+    echo "WARN: Removing stale lock from dead process (PID ${holder_pid:-unknown})." >&2
+    rm -rf "$LOCK_FILE"
+    # Retry once
+    _acquire_lock
+  fi
+}
+
+_release_lock() {
+  rm -rf "$LOCK_FILE" 2>/dev/null || true
+}
+
+# ─── Pipeline State ──────────────────────────────────────────────────────────
+
+CURRENT_SESSION_ID=""
+RESUME_SESSION_ID=""
+BASELINE_COMMIT=""
+CURRENT_PHASE_NAME=""
+LAST_RESPONSE_TEXT=""
+
+# Prompt suffix to prevent Claude from asking questions mid-pipeline
+NO_QUESTIONS="Do not ask questions. Make reasonable decisions based on the spec, governance docs, and codebase context. If truly ambiguous, choose the simpler option and note your assumption."
+
+# Test suite results — populated by _run_all_suites
+LAST_PASSED_SUITES=""
+LAST_FAILED_SUITES=""
+LAST_TEST_OUTPUT=""
+
+# Track whether we've passed the authoring/quality seam
+_PAST_SEAM=false
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+log() {
+  local level="$1"
+  shift
+  local msg="$*"
+  local timestamp
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  case "$level" in
+    INFO)  printf "\033[0;34m[%s INFO]\033[0m %s\n" "$timestamp" "$msg" ;;
+    OK)    printf "\033[0;32m[%s OK]\033[0m %s\n" "$timestamp" "$msg" ;;
+    WARN)  printf "\033[0;33m[%s WARN]\033[0m %s\n" "$timestamp" "$msg" ;;
+    ERROR) printf "\033[0;31m[%s ERROR]\033[0m %s\n" "$timestamp" "$msg" ;;
+    *)     printf "[%s] %s\n" "$timestamp" "$msg" ;;
+  esac
+
+  printf "[%s %s] %s\n" "$timestamp" "$level" "$msg" >> "$LOG_FILE"
+}
+
+# ─── Progress Spinner ────────────────────────────────────────────────────────
+# Shows elapsed time while Claude is working. Only displays when stdout is a
+# terminal. Killed automatically by the INT trap or by the caller.
+
+_show_progress() {
+  [ ! -t 1 ] && return
+  local msg="$1"
+  local start=$SECONDS
+  while true; do
+    local elapsed=$((SECONDS - start))
+    local mins=$((elapsed / 60))
+    local secs=$((elapsed % 60))
+    printf "\r\033[0;36m⏳ %s [%d:%02d]\033[0m" "$msg" "$mins" "$secs"
+    sleep 1
+  done
+}
+
+# ─── Structured State File ───────────────────────────────────────────────────
+#
+# Single JSON file that replaces the old checkpoint, transcript, and baseline
+# files. Two sections with different reliability guarantees:
+#
+#   deterministic — engine-populated from git and test runners. Always accurate.
+#   semantic      — Claude-populated via extraction call at the seam. Richer but lossy.
+#
+# State is updated after every phase. Quality phases read it via context packs.
+
+_init_state() {
+  local now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  jq -n \
+    --arg spec "$SPEC_FILE" \
+    --arg root "$PROJECT_ROOT" \
+    --arg name "$PROJECT_NAME" \
+    --arg baseline "${BASELINE_COMMIT:-}" \
+    --arg started "$now" \
+    '{
+      schema_version: 1,
+      run: {
+        spec_file: $spec,
+        project_root: $root,
+        project_name: $name,
+        baseline_commit: $baseline,
+        started_at: $started,
+        status: "running"
+      },
+      phases: {},
+      deterministic: {
+        files_changed: [],
+        files_created: [],
+        test_results: {
+          final_status: "pending",
+          iterations_needed: 0,
+          suites: {}
+        },
+        loc_status: {
+          over_limit: [],
+          max_observed: 0
+        },
+        ci_checks_results: {
+          checks_discovered: [],
+          final_status: "pending",
+          iterations_needed: 0,
+          auto_fixed: [],
+          claude_fixed: []
+        }
+      },
+      semantic: {
+        plan_intent: null,
+        plan_checklist: [],
+        governance_ids: [],
+        implementation_summary: null,
+        key_decisions: [],
+        test_fix_summary: null,
+        completed_quality_phases: [],
+        skill_chain_findings: null,
+        review_findings: null,
+        doc_update_summary: null
+      }
+    }' > "$STATE_FILE"
+
+  log INFO "State file initialized: $STATE_FILE"
+}
+
+# Read a value from the state file via jq expression.
+_state_get() {
+  jq -r "$1" "$STATE_FILE" 2>/dev/null
+}
+
+# Safe jq state update. Reads STATE_FILE, applies the jq filter, and atomically
+# replaces it. Exits with explicit error if jq fails (don't rely on set -e
+# propagation through && chains, which is broken in bash 3.2).
+_jq_update() {
+  # All args except the last are jq flags; the last is the filter expression
+  if ! jq "$@" "$STATE_FILE" > "${STATE_FILE}.tmp"; then
+    log ERROR "jq state update failed (filter: ${*: -1})"
+    rm -f "${STATE_FILE}.tmp"
+    return 1
+  fi
+  mv "${STATE_FILE}.tmp" "$STATE_FILE"
+}
+
+# Update phase status (in_progress | completed) with timestamp and session ID.
+_update_phase_status() {
+  local phase="$1" status="$2"
+  local now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local session="${CURRENT_SESSION_ID:-}"
+
+  if [ "$status" = "in_progress" ]; then
+    _jq_update --arg p "$phase" --arg s "$status" --arg t "$now" --arg sid "$session" \
+      '.phases[$p] = ((.phases[$p] // {}) + {status: $s, session_id: $sid, started_at: $t})'
+  elif [ "$status" = "completed" ]; then
+    _jq_update --arg p "$phase" --arg s "$status" --arg t "$now" --arg sid "$session" \
+      '.phases[$p] = ((.phases[$p] // {}) + {status: $s, session_id: $sid, completed_at: $t})'
+  fi
+}
+
+# Refresh deterministic state from git. Called after every phase.
+_update_deterministic_state() {
+  if [ "$HAS_GIT" = false ]; then return 0; fi
+  cd "$PROJECT_ROOT"
+
+  # All files that changed during this session (tracked + new untracked)
+  local all_changed
+  all_changed=$(get_changed_files)
+
+  # New untracked files only (files created during this session)
+  local new_untracked=""
+  local current_untracked
+  current_untracked=$(git ls-files --others --exclude-standard 2>/dev/null)
+  if [ -f "$BASELINE_FILE" ]; then
+    new_untracked=$(comm -23 <(echo "$current_untracked" | sort) <(sort "$BASELINE_FILE"))
+  fi
+
+  # Convert newline-separated lists to JSON arrays
+  local changed_json created_json
+  # sed strips blank lines (grep -v '^$' exits 1 on no match, which triggers ERR with -E)
+  changed_json=$(echo "$all_changed" | sed '/^$/d' | jq -R . | jq -s '.' 2>/dev/null || echo '[]')
+  created_json=$(echo "$new_untracked" | sed '/^$/d' | jq -R . | jq -s '.' 2>/dev/null || echo '[]')
+
+  _jq_update --argjson changed "$changed_json" --argjson created "$created_json" \
+    '.deterministic.files_changed = $changed | .deterministic.files_created = $created'
+}
+
+# Update test results in deterministic state.
+_update_test_results() {
+  local final_status="$1" iterations="$2"
+
+  # Build suites JSON from the LAST_PASSED/FAILED globals
+  local suites_json="{}"
+  for name in $LAST_PASSED_SUITES; do
+    suites_json=$(echo "$suites_json" | jq --arg n "$name" '. + {($n): {"status": "pass", "exit_code": 0}}')
+  done
+  for name in $LAST_FAILED_SUITES; do
+    suites_json=$(echo "$suites_json" | jq --arg n "$name" '. + {($n): {"status": "fail", "exit_code": 1}}')
+  done
+
+  _jq_update --arg s "$final_status" --argjson i "$iterations" --argjson suites "$suites_json" \
+    '.deterministic.test_results = {final_status: $s, iterations_needed: $i, suites: $suites}'
+}
+
+# ─── Claude Invocation ───────────────────────────────────────────────────────
+#
+# _invoke_claude — Single point for all Claude calls. Runs claude with a
+#   progress spinner, parses JSON output, updates session tracking, and
+#   stores the response in LAST_RESPONSE_TEXT for extraction parsing.
+#
+# run_claude — Continues the authoring conversation. On resume from crash,
+#   uses a three-tier fallback: --resume <id> → --continue → state injection.
+#
+# run_claude_fresh — Starts a new conversation (for quality phases).
+
+_invoke_claude() {
+  local prompt="$1"
+  shift
+  local full_prompt="${prompt} ${NO_QUESTIONS}"
+
+  # --dangerously-skip-permissions is required because the pipeline is autonomous.
+  # Without it, claude prompts for tool approval, but since output is captured
+  # there's no way to respond — the process hangs.
+  local cmd=(claude -p "$full_prompt" --dangerously-skip-permissions --output-format json)
+  if [ $# -gt 0 ]; then
+    cmd+=("$@")
+  fi
+
+  local tmp_output exit_code=0
+  tmp_output=$(mktemp)
+
+  # Show progress spinner while Claude works
+  local spinner_pid=""
+  if [ -t 1 ]; then
+    _show_progress "${CURRENT_PHASE_NAME:-Claude} ..." &
+    spinner_pid=$!
+    # Disown so the spinner doesn't produce job control messages
+    disown "$spinner_pid" 2>/dev/null || true
+  fi
+
+  # Run claude, capture output to temp file
+  "${cmd[@]}" > "$tmp_output" 2>&1 || exit_code=$?
+
+  # Stop spinner and clear the line
+  if [ -n "$spinner_pid" ]; then
+    kill "$spinner_pid" 2>/dev/null
+    wait "$spinner_pid" 2>/dev/null || true
+    printf "\r\033[K"
+  fi
+
+  local raw_output
+  raw_output=$(<"$tmp_output")
+  rm -f "$tmp_output"
+
+  # Parse session ID and response text from JSON
+  local session_id response_text
+  session_id=$(jq -r '.session_id // empty' <<< "$raw_output" 2>/dev/null) || true
+  response_text=$(jq -r '.result // empty' <<< "$raw_output" 2>/dev/null) || true
+
+  # If JSON parsing failed, treat raw output as response text
+  if [ -z "$response_text" ]; then
+    response_text="$raw_output"
+  fi
+
+  # Update session tracking
+  if [ -n "$session_id" ]; then
+    CURRENT_SESSION_ID="$session_id"
+  fi
+
+  # Store for extraction parsing
+  LAST_RESPONSE_TEXT="$response_text"
+
+  # Display and log
+  echo "$response_text" | tee -a "$LOG_FILE"
+
+  return $exit_code
+}
+
+# Continue the authoring conversation. On resume from crash, uses a three-tier
+# fallback: --resume <id> → --continue → structured state injection.
+run_claude() {
+  local prompt="$1"
+  log INFO "Running Claude: ${prompt:0:80}..."
+
+  # Resuming from crash — try the fallback chain
+  if [ -n "$RESUME_SESSION_ID" ]; then
+    local saved_id="$RESUME_SESSION_ID"
+    RESUME_SESSION_ID=""  # Clear so subsequent calls use --continue
+
+    log INFO "Resuming session ${saved_id:0:12}..."
+    if _invoke_claude "$prompt" --resume "$saved_id"; then
+      return 0
+    fi
+
+    log WARN "Session resume failed, trying --continue..."
+    if _invoke_claude "$prompt" --continue; then
+      return 0
+    fi
+
+    # Last resort: inject structured state into fresh context.
+    # This replaces the old raw transcript injection — structured state
+    # is more targeted and less noisy.
+    if [ -f "$STATE_FILE" ]; then
+      log WARN "--continue failed, falling back to structured state..."
+      local state_context
+      state_context=$(_build_context_pack "final")
+      _invoke_claude "Context from previous pipeline phases:
+
+${state_context}
+
+---
+
+${prompt}"
+      return $?
+    fi
+
+    log WARN "No fallback available, starting fresh..."
+    _invoke_claude "$prompt"
+    return $?
+  fi
+
+  # Normal execution — continue the conversation
+  _invoke_claude "$prompt" --continue
+}
+
+# Start a new conversation (no --continue). Used for quality phases that
+# receive context packs instead of relying on conversation memory.
+run_claude_fresh() {
+  local prompt="$1"
+  log INFO "Running Claude (fresh context): ${prompt:0:80}..."
+  _invoke_claude "$prompt"
+}
+
+# ─── Extraction Protocol ─────────────────────────────────────────────────────
+#
+# Called once at the authoring/quality seam (after test_fix, before skill_chain).
+# Asks Claude to summarise the authoring work into structured JSON, then merges
+# it into the state file's semantic section. This is the single extra Claude call
+# that funds all subsequent fresh sessions with bounded context.
+
+_extract_authoring_summary() {
+  log INFO "Extracting authoring summary at seam..."
+
+  run_claude "You have completed the planning, implementation, and test-fixing phases. Before moving to code review, summarise your work as structured JSON.
+
+Output ONLY valid JSON (no markdown fences, no commentary before or after). Use these exact fields:
+
+{
+  \"plan_intent\": \"1-2 sentence summary of what was planned and why\",
+  \"plan_checklist\": [\"short description of each plan item\"],
+  \"governance_ids\": [\"principle IDs from CONTEXT_INDEX.md that were applied, or empty array\"],
+  \"implementation_summary\": \"2-3 sentences describing what was built, key files, and approach\",
+  \"key_decisions\": [{\"decision\": \"what was decided\", \"rationale\": \"why\"}],
+  \"test_fix_summary\": \"what broke during testing and how it was fixed, or 'All tests passed on first iteration'\"
+}"
+
+  # Try to parse the response as JSON directly
+  local parsed=""
+  if parsed=$(echo "$LAST_RESPONSE_TEXT" | jq '.' 2>/dev/null); then
+    _jq_update --argjson s "$parsed" \
+      '.semantic = (.semantic + $s)'
+    log OK "Authoring summary extracted and saved to state"
+    return 0
+  fi
+
+  # Claude may have wrapped JSON in markdown fences — extract and retry
+  local extracted
+  extracted=$(echo "$LAST_RESPONSE_TEXT" | sed -n '/^```\(json\)\{0,1\}$/,/^```$/p' | sed '1d;$d')
+  if [ -n "$extracted" ] && parsed=$(echo "$extracted" | jq '.' 2>/dev/null); then
+    _jq_update --argjson s "$parsed" \
+      '.semantic = (.semantic + $s)'
+    log OK "Authoring summary extracted (from markdown fence) and saved to state"
+    return 0
+  fi
+
+  log WARN "Could not parse extraction response as JSON — semantic state will be empty"
+  log WARN "Quality phases will proceed with deterministic context only"
+}
+
+# Called after fresh_review to capture warnings, limitations, and follow-up items.
+# Continues the fresh_review conversation (run_claude, not run_claude_fresh) so
+# Claude has full context of what it just reviewed. The findings flow into the
+# final phase's context pack, which is where "Known Limitations" comes from.
+_extract_review_findings() {
+  log INFO "Extracting review findings..."
+
+  run_claude "Summarise the review you just completed as structured JSON.
+
+Output ONLY valid JSON (no markdown fences, no commentary). Use these exact fields:
+
+{
+  \"issues_fixed\": [\"brief description of each issue you found and fixed\"],
+  \"warnings\": [\"things worth noting but not blocking — limitations, edge cases, follow-up work\"],
+  \"approved_files\": [\"files that passed review without issues\"]
+}"
+
+  local parsed=""
+  if parsed=$(echo "$LAST_RESPONSE_TEXT" | jq '.' 2>/dev/null); then
+    _jq_update --argjson f "$parsed" \
+      '.semantic.review_findings = $f'
+    log OK "Review findings saved to state"
+    return 0
+  fi
+
+  # Try extracting from markdown fences
+  local extracted
+  extracted=$(echo "$LAST_RESPONSE_TEXT" | sed -n '/^```\(json\)\{0,1\}$/,/^```$/p' | sed '1d;$d')
+  if [ -n "$extracted" ] && parsed=$(echo "$extracted" | jq '.' 2>/dev/null); then
+    _jq_update --argjson f "$parsed" \
+      '.semantic.review_findings = $f'
+    log OK "Review findings saved to state (from markdown fence)"
+    return 0
+  fi
+
+  log WARN "Could not parse review findings — final summary will lack limitation details"
+}
+
+# Called after skill_chain to capture what the code review, security audit, and
+# simplification passes found and fixed. Continues the skill_chain conversation.
+_extract_skill_chain_findings() {
+  log INFO "Extracting skill chain findings..."
+
+  run_claude "Summarise the code review, security review, and simplification you just completed as structured JSON.
+
+Output ONLY valid JSON (no markdown fences, no commentary). Use these exact fields:
+
+{
+  \"code_review_issues\": [\"brief description of each code quality issue found and fixed\"],
+  \"security_assessment\": \"1-2 sentence summary of security findings (issues found or verified clean)\",
+  \"simplifications\": [\"brief description of each simplification made\"],
+  \"verified_clean\": [\"aspects verified with no issues (e.g. layer boundaries, naming, error handling)\"]
+}"
+
+  local parsed=""
+  if parsed=$(echo "$LAST_RESPONSE_TEXT" | jq '.' 2>/dev/null); then
+    _jq_update --argjson f "$parsed" \
+      '.semantic.skill_chain_findings = $f'
+    log OK "Skill chain findings saved to state"
+    return 0
+  fi
+
+  local extracted
+  extracted=$(echo "$LAST_RESPONSE_TEXT" | sed -n '/^```\(json\)\{0,1\}$/,/^```$/p' | sed '1d;$d')
+  if [ -n "$extracted" ] && parsed=$(echo "$extracted" | jq '.' 2>/dev/null); then
+    _jq_update --argjson f "$parsed" \
+      '.semantic.skill_chain_findings = $f'
+    log OK "Skill chain findings saved to state (from markdown fence)"
+    return 0
+  fi
+
+  log WARN "Could not parse skill chain findings"
+}
+
+# Called after doc_update to capture which docs were updated and how.
+# Continues the doc_update conversation.
+_extract_doc_update_summary() {
+  log INFO "Extracting doc update summary..."
+
+  run_claude "Summarise the documentation updates you just made as structured JSON.
+
+Output ONLY valid JSON (no markdown fences, no commentary). Use these exact fields:
+
+{
+  \"docs_updated\": [{\"file\": \"path/to/doc.md\", \"changes\": \"brief description of what was updated\"}],
+  \"docs_unchanged\": [\"files checked but not needing updates\"]
+}"
+
+  local parsed=""
+  if parsed=$(echo "$LAST_RESPONSE_TEXT" | jq '.' 2>/dev/null); then
+    _jq_update --argjson f "$parsed" \
+      '.semantic.doc_update_summary = $f'
+    log OK "Doc update summary saved to state"
+    return 0
+  fi
+
+  local extracted
+  extracted=$(echo "$LAST_RESPONSE_TEXT" | sed -n '/^```\(json\)\{0,1\}$/,/^```$/p' | sed '1d;$d')
+  if [ -n "$extracted" ] && parsed=$(echo "$extracted" | jq '.' 2>/dev/null); then
+    _jq_update --argjson f "$parsed" \
+      '.semantic.doc_update_summary = $f'
+    log OK "Doc update summary saved to state (from markdown fence)"
+    return 0
+  fi
+
+  log WARN "Could not parse doc update summary"
+}
+
+# ─── Context Pack Builder ────────────────────────────────────────────────────
+#
+# Assembles a tailored markdown prompt from the state file for each quality phase.
+# Each phase gets different context:
+#   skill_chain:     intent + files + test status (needs intent to judge correctness)
+#   loc_enforcement: files + prior findings (mechanical — doesn't need intent)
+#   fresh_review:    files + prior phases only, NO intent (cold review, avoids anchoring)
+#   doc_update:      intent + files + all prior findings (needs to know the feature)
+#   final:           full state (produces human-readable summary)
+
+_build_context_pack() {
+  local phase="$1"
+
+  case "$phase" in
+    skill_chain)
+      jq -r '
+        "## Session Context\n\n" +
+        "**Goal:** " + (.semantic.plan_intent // "(not extracted)") + "\n\n" +
+        "**Implementation:** " + (.semantic.implementation_summary // "(not extracted)") + "\n\n" +
+        "**Key decisions:**\n" +
+          ([ (.semantic.key_decisions // [])[] | "- " + .decision + ": " + .rationale ] | join("\n")) + "\n\n" +
+        "**Files changed:**\n" +
+          ([ (.deterministic.files_changed // [])[] | "- " + . ] | join("\n")) + "\n\n" +
+        "**Test status:** " + (.deterministic.test_results.final_status // "unknown") +
+          " after " + ((.deterministic.test_results.iterations_needed // 0) | tostring) + " iteration(s).\n" +
+        (.semantic.test_fix_summary // "") + "\n\n" +
+        "**CI checks:** " + (.deterministic.ci_checks_results.final_status // "pending") +
+          " (auto-fixed: " +
+          ([ (.deterministic.ci_checks_results.auto_fixed // [])[] ] | if length == 0 then "none" else join(", ") end) +
+          ", Claude-fixed: " +
+          ([ (.deterministic.ci_checks_results.claude_fixed // [])[] ] | if length == 0 then "none" else join(", ") end) +
+          ")"
+      ' "$STATE_FILE" 2>/dev/null || echo "## Session Context
+
+(state unavailable — review the changed files directly)"
+      ;;
+
+    loc_enforcement)
+      jq -r '
+        "## Session Context\n\n" +
+        "**Completed quality phases:** " +
+          ([ (.semantic.completed_quality_phases // [])[] ] | if length == 0 then "none" else join(", ") end) + "\n\n" +
+        "**Files changed:**\n" +
+          ([ (.deterministic.files_changed // [])[] | "- " + . ] | join("\n"))
+      ' "$STATE_FILE" 2>/dev/null || echo "## Session Context
+
+(state unavailable)"
+      ;;
+
+    fresh_review)
+      # NO intent — cold review to avoid anchoring bias.
+      # Includes prior quality phases so the reviewer doesn't re-report fixed issues.
+      jq -r '
+        "## Session Context\n\n" +
+        "**Completed quality phases:** " +
+          ([ (.semantic.completed_quality_phases // [])[] ] | if length == 0 then "none" else join(", ") end) + "\n\n" +
+        "**Files changed:**\n" +
+          ([ (.deterministic.files_changed // [])[] | "- " + . ] | join("\n")) + "\n\n" +
+        "**Files created:**\n" +
+          ([ (.deterministic.files_created // [])[] | "- " + . ] | join("\n"))
+      ' "$STATE_FILE" 2>/dev/null || echo "## Session Context
+
+(state unavailable)"
+      ;;
+
+    doc_update)
+      jq -r '
+        "## Session Context\n\n" +
+        "**Goal:** " + (.semantic.plan_intent // "(not extracted)") + "\n\n" +
+        "**Implementation:** " + (.semantic.implementation_summary // "(not extracted)") + "\n\n" +
+        "**Completed quality phases:** " +
+          ([ (.semantic.completed_quality_phases // [])[] ] | if length == 0 then "none" else join(", ") end) + "\n\n" +
+        "**Files changed:**\n" +
+          ([ (.deterministic.files_changed // [])[] | "- " + . ] | join("\n")) + "\n\n" +
+        "**Files created:**\n" +
+          ([ (.deterministic.files_created // [])[] | "- " + . ] | join("\n"))
+      ' "$STATE_FILE" 2>/dev/null || echo "## Session Context
+
+(state unavailable)"
+      ;;
+
+    final|*)
+      # Full state for summary generation or unknown phases
+      jq -r '
+        "## Session Summary\n\n" +
+        "**Goal:** " + (.semantic.plan_intent // "(not extracted)") + "\n" +
+        "**Governance:** " +
+          ([ (.semantic.governance_ids // [])[] ] | if length == 0 then "none" else join(", ") end) + "\n\n" +
+        "**Plan:**\n" +
+          ([ (.semantic.plan_checklist // [])[] | "- " + . ] | join("\n")) + "\n\n" +
+        "**Implementation:** " + (.semantic.implementation_summary // "(not extracted)") + "\n\n" +
+        "**Key decisions:**\n" +
+          ([ (.semantic.key_decisions // [])[] | "- " + .decision + ": " + .rationale ] | join("\n")) + "\n\n" +
+        "**Test results:** " + (.deterministic.test_results.final_status // "unknown") +
+          " after " + ((.deterministic.test_results.iterations_needed // 0) | tostring) + " iteration(s).\n" +
+        (.semantic.test_fix_summary // "") + "\n\n" +
+        "**CI checks:** " + (.deterministic.ci_checks_results.final_status // "pending") +
+          " (auto-fixed: " +
+          ([ (.deterministic.ci_checks_results.auto_fixed // [])[] ] | if length == 0 then "none" else join(", ") end) +
+          ", Claude-fixed: " +
+          ([ (.deterministic.ci_checks_results.claude_fixed // [])[] ] | if length == 0 then "none" else join(", ") end) +
+          ")\n\n" +
+        "**Files changed:**\n" +
+          ([ (.deterministic.files_changed // [])[] | "- " + . ] | join("\n")) + "\n\n" +
+        "**Files created:**\n" +
+          ([ (.deterministic.files_created // [])[] | "- " + . ] | join("\n")) + "\n\n" +
+        "**Skill chain (code review + security + simplification):**\n" +
+          (if (.semantic.skill_chain_findings | type) == "object" then
+            "Code review issues fixed:\n" +
+              ([ (.semantic.skill_chain_findings.code_review_issues // [])[] | "- " + . ] | join("\n")) + "\n" +
+            "Security: " + (.semantic.skill_chain_findings.security_assessment // "(not captured)") + "\n" +
+            "Simplifications:\n" +
+              ([ (.semantic.skill_chain_findings.simplifications // [])[] | "- " + . ] | join("\n")) + "\n" +
+            "Verified clean:\n" +
+              ([ (.semantic.skill_chain_findings.verified_clean // [])[] | "- " + . ] | join("\n"))
+          else "(not captured)" end) + "\n\n" +
+        "**Fresh review findings:**\n" +
+          (if (.semantic.review_findings | type) == "object" then
+            "Issues fixed:\n" +
+              ([ (.semantic.review_findings.issues_fixed // [])[] | "- " + . ] | join("\n")) + "\n" +
+            "Warnings / known limitations:\n" +
+              ([ (.semantic.review_findings.warnings // [])[] | "- " + . ] | join("\n")) + "\n" +
+            "Approved files:\n" +
+              ([ (.semantic.review_findings.approved_files // [])[] | "- " + . ] | join("\n"))
+          else "(not captured)" end) + "\n\n" +
+        "**Documentation updates:**\n" +
+          (if (.semantic.doc_update_summary | type) == "object" then
+            "Updated:\n" +
+              ([ (.semantic.doc_update_summary.docs_updated // [])[] | "- " + .file + ": " + .changes ] | join("\n")) + "\n" +
+            "Unchanged:\n" +
+              ([ (.semantic.doc_update_summary.docs_unchanged // [])[] | "- " + . ] | join("\n"))
+          else "(not captured)" end)
+      ' "$STATE_FILE" 2>/dev/null || echo "## Session Summary
+
+(state unavailable)"
+      ;;
+  esac
+}
+
+# ─── Changed File Detection ──────────────────────────────────────────────────
+
+get_changed_files() {
+  if [ "$HAS_GIT" = false ]; then
+    log WARN "No git repo — cannot detect changed files."
+    return 0
+  fi
+  cd "$PROJECT_ROOT"
+
+  # Diff tracked files against the baseline commit captured at pipeline start.
+  # This covers committed + staged + unstaged changes made during this session,
+  # without picking up pre-existing dirty state from before the pipeline ran.
+  local tracked_changes=""
+  if [ -n "$BASELINE_COMMIT" ]; then
+    tracked_changes=$(git diff --name-only "$BASELINE_COMMIT" 2>/dev/null)
+  else
+    # No baseline (shouldn't happen) — fall back to unstaged + staged
+    tracked_changes=$(git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null)
+  fi
+
+  # For untracked files: subtract the baseline snapshot so only files created
+  # during this session appear. Without this, every pre-existing untracked file
+  # (specs, skills/, data files) pollutes the list.
+  local current_untracked new_untracked=""
+  current_untracked=$(git ls-files --others --exclude-standard 2>/dev/null)
+  if [ -f "$BASELINE_FILE" ]; then
+    # comm requires sorted input; baseline file is already sorted
+    new_untracked=$(comm -23 <(echo "$current_untracked" | sort) <(sort "$BASELINE_FILE"))
+  else
+    new_untracked="$current_untracked"
+  fi
+
+  { echo "$tracked_changes"; echo "$new_untracked"; } | sed '/^$/d' | sort -u
+}
+
+# ─── Test Suite Infrastructure ───────────────────────────────────────────────
+#
+# Projects define test_suite_*() functions in .auto_claude.conf. The core
+# auto-discovers all of them, runs each independently, and reports per-suite
+# pass/fail. This gives targeted fix prompts (Claude knows which suite failed)
+# and loud failure on misconfiguration (wrong path shows the suite name).
+
+_discover_test_suites() {
+  declare -F | awk '{print $3}' | grep '^test_suite_' || true
+}
+
+_run_all_suites() {
+  local suites
+  suites=$(_discover_test_suites)
+
+  LAST_PASSED_SUITES=""
+  LAST_FAILED_SUITES=""
+  LAST_TEST_OUTPUT=""
+
+  local any_failed=0
+
+  for suite in $suites; do
+    local name="${suite#test_suite_}"
+    log INFO "Running test suite: ${name}..."
+    local suite_output suite_exit=0
+    suite_output=$("$suite" 2>&1) || suite_exit=$?
+
+    LAST_TEST_OUTPUT+="
+=== Suite: ${name} (exit ${suite_exit}) ===
+${suite_output}"
+
+    if [ $suite_exit -eq 0 ]; then
+      LAST_PASSED_SUITES+="${name} "
+      log OK "Suite ${name}: PASS"
+    else
+      LAST_FAILED_SUITES+="${name} "
+      log WARN "Suite ${name}: FAIL"
+      any_failed=1
+    fi
+  done
+
+  return $any_failed
+}
+
+# ─── CI Check Infrastructure ─────────────────────────────────────────────────
+#
+# Projects define ci_check_*() and optional ci_fix_*() functions in
+# .auto_claude.conf. If none are defined, _auto_discover_ci_checks reads
+# package.json and synthesises them. The ci_checks phase runs each check,
+# auto-fixes what it can, and sends unfixable issues to Claude.
+#
+# Convention:
+#   ci_check_<name>()  — exit 0 = pass, non-zero = fail. Output goes to stdout.
+#   ci_fix_<name>()    — auto-fix command. If absent, failures go to Claude.
+
+_discover_ci_checks() {
+  declare -F | awk '{print $3}' | grep '^ci_check_' || true
+}
+
+_has_ci_fix() {
+  local name="$1"
+  declare -F "ci_fix_${name}" &>/dev/null
+}
+
+# Auto-discover CI checks from package.json when no ci_check_* functions
+# are defined in .auto_claude.conf. Dynamically defines ci_check_*/ci_fix_*
+# functions based on detected scripts.
+_auto_discover_ci_checks() {
+  # Skip if user already defined ci_check_* functions in .conf
+  if [ -n "$(_discover_ci_checks)" ]; then
+    return 0
+  fi
+
+  local pkg="${PROJECT_ROOT}/package.json"
+  [ -f "$pkg" ] || return 0
+
+  local scripts
+  scripts=$(jq -r '.scripts // {} | keys[]' "$pkg" 2>/dev/null) || return 0
+
+  # Prettier / format check
+  if echo "$scripts" | grep -qx 'prettier-check'; then
+    eval 'ci_check_format() { cd "$PROJECT_ROOT" && npm run prettier-check 2>&1; }'
+    if echo "$scripts" | grep -qx 'prettier-fix'; then
+      eval 'ci_fix_format() { cd "$PROJECT_ROOT" && npm run prettier-fix 2>&1; }'
+    else
+      eval 'ci_fix_format() { cd "$PROJECT_ROOT" && npx prettier --write . 2>&1; }'
+    fi
+  elif echo "$scripts" | grep -qx 'format:check'; then
+    eval 'ci_check_format() { cd "$PROJECT_ROOT" && npm run format:check 2>&1; }'
+    if echo "$scripts" | grep -qx 'format'; then
+      eval 'ci_fix_format() { cd "$PROJECT_ROOT" && npm run format 2>&1; }'
+    fi
+  fi
+
+  # Lint
+  if echo "$scripts" | grep -qx 'lint'; then
+    eval 'ci_check_lint() { cd "$PROJECT_ROOT" && npm run lint 2>&1; }'
+    if echo "$scripts" | grep -qx 'lint:fix'; then
+      eval 'ci_fix_lint() { cd "$PROJECT_ROOT" && npm run lint:fix 2>&1; }'
+    else
+      eval 'ci_fix_lint() { cd "$PROJECT_ROOT" && npm run lint -- --fix 2>&1; }'
+    fi
+  fi
+
+  # Type checking — look for explicit scripts first, then fallback to tsc
+  local tc_script=""
+  for candidate in typecheck type-check tsc; do
+    if echo "$scripts" | grep -qx "$candidate"; then
+      tc_script="$candidate"
+      break
+    fi
+  done
+
+  if [ -n "$tc_script" ]; then
+    eval "ci_check_types() { cd \"\$PROJECT_ROOT\" && npm run $tc_script 2>&1; }"
+  elif jq -e '.devDependencies.typescript // .dependencies.typescript' "$pkg" &>/dev/null; then
+    eval 'ci_check_types() { cd "$PROJECT_ROOT" && npx tsc --noEmit 2>&1; }'
+  fi
+  # No ci_fix_types — type errors go to Claude
+}
+
+# ─── Default Hooks ───────────────────────────────────────────────────────────
+
+# Default long-file finder — searches PROJECT_ROOT for common extensions,
+# excluding tests, node_modules, and dist. Projects can override by defining
+# project_find_long_files() in .auto_claude.conf.
+_default_find_long_files() {
+  local threshold="$1"
+  find "$PROJECT_ROOT" \
+    -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \
+    -o -name "*.py" -o -name "*.go" -o -name "*.rs" -o -name "*.rb" \) \
+    ! -name "*.test.*" ! -name "*.spec.*" ! -name "test_*" \
+    ! -path "*/node_modules/*" ! -path "*/__pycache__/*" ! -path "*/dist/*" \
+    -exec sh -c 'lines=$(wc -l < "$1"); if [ "$lines" -gt '"$threshold"' ]; then echo "$lines $1"; fi' _ {} \; \
+    | sort -rn
+}
+
+# Dispatcher — uses project hook if defined, otherwise the default.
+_find_long_files() {
+  if declare -F project_find_long_files &>/dev/null; then
+    project_find_long_files "$@"
+  else
+    _default_find_long_files "$@"
+  fi
+}
+
+# Filter _find_long_files output to only include session-changed files.
+# Without this, LOC enforcement loops forever on pre-existing long files
+# that the pipeline didn't create — Claude correctly refuses to touch them,
+# nothing changes, and the loop repeats until MAX_REFACTOR_ROUNDS.
+_filter_to_changed() {
+  local changed="$1"
+  [ -z "$changed" ] && return
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    local fpath
+    fpath="$(echo "$line" | awk '{print $2}')"
+    local relpath="${fpath#"$PROJECT_ROOT"/}"
+    if echo "$changed" | grep -qxF "$relpath"; then
+      echo "$line"
+    fi
+  done
+}
+
+# ─── Phase Functions ─────────────────────────────────────────────────────────
+#
+# Authoring phases (plan, implement, test_fix) use run_claude (--continue)
+# to share a single conversation with full context.
+#
+# Quality phases (skill_chain onward) use run_claude_fresh with a context pack
+# for their first call, then run_claude (--continue) for subsequent calls
+# within the same phase. Each quality phase starts a new conversation.
+
+phase_plan() {
+  if [ ! -f "$SPEC_FILE" ]; then
+    log ERROR "Spec file not found: $SPEC_FILE"
+    exit 1
+  fi
+
+  local spec_content
+  spec_content="$(cat "$SPEC_FILE")"
+
+  local plan_prompt="You are working on the ${PROJECT_NAME} project.
+
+${PLAN_CONTEXT:+${PLAN_CONTEXT}
+
+}Read this feature spec and create a detailed implementation plan:
+
+---
+${spec_content}
+---
+
+Your plan MUST:
+1. List every file to create or modify
+2. Ensure every change is testable
+3. Identify what can be implemented in parallel vs what must be sequential
+
+Output the plan as a numbered checklist."
+
+  run_claude "$plan_prompt"
+  log OK "Planning complete"
+}
+
+phase_implement() {
+  run_claude "Execute the implementation plan you created in the previous step.
+Implement all changes now. Follow the plan exactly.
+Write tests alongside implementation.
+Commit nothing — just write the code."
+
+  log OK "Implementation complete"
+}
+
+phase_test_fix() {
+  log INFO "Test-fix loop (max ${MAX_TEST_ITERATIONS} iterations)"
+
+  local iteration=0
+
+  while [ $iteration -lt $MAX_TEST_ITERATIONS ]; do
+    iteration=$((iteration + 1))
+    log INFO "Test iteration ${iteration}/${MAX_TEST_ITERATIONS}"
+
+    local test_exit=0
+    _run_all_suites || test_exit=$?
+
+    if [ $test_exit -eq 0 ]; then
+      log OK "All tests pass on iteration ${iteration}"
+      _update_test_results "pass" "$iteration"
+      return 0
+    fi
+
+    log WARN "Tests failed on iteration ${iteration}, asking Claude to fix..."
+
+    # Truncate to last 400 lines to stay within prompt limits
+    local truncated_output
+    truncated_output=$(echo "$LAST_TEST_OUTPUT" | tail -n 400)
+    if [ "$(echo "$LAST_TEST_OUTPUT" | wc -l)" -gt 400 ]; then
+      truncated_output="[...truncated to last 400 lines...]
+${truncated_output}"
+    fi
+
+    run_claude "Tests are failing. Failed suites: ${LAST_FAILED_SUITES}
+Passed suites: ${LAST_PASSED_SUITES}
+
+Here is the test output:
+
+\`\`\`
+${truncated_output}
+\`\`\`
+
+Fix the failures in the failing suites. Do not change test expectations unless the test itself is wrong.
+Fix the implementation to match the tests."
+  done
+
+  _update_test_results "fail" "$MAX_TEST_ITERATIONS"
+  log ERROR "Tests still failing after ${MAX_TEST_ITERATIONS} iterations"
+  return 1
+}
+
+phase_ci_checks() {
+  local checks
+  checks=$(_discover_ci_checks)
+
+  if [ -z "$checks" ]; then
+    log OK "No CI checks configured — skipping"
+    _jq_update '.deterministic.ci_checks_results.final_status = "skipped"'
+    return 0
+  fi
+
+  # Record discovered checks in state
+  local check_names=()
+  for check_fn in $checks; do
+    check_names+=("${check_fn#ci_check_}")
+  done
+  _jq_update --argjson names "$(printf '%s\n' "${check_names[@]}" | jq -R . | jq -s .)" \
+    '.deterministic.ci_checks_results.checks_discovered = $names'
+
+  log INFO "CI checks (max ${MAX_CI_ITERATIONS} iterations)"
+
+  local ci_tmp_dir
+  ci_tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ac_ci_checks.XXXXXX")
+  trap "rm -rf '$ci_tmp_dir'" RETURN
+
+  local iteration=0
+  while [ $iteration -lt $MAX_CI_ITERATIONS ]; do
+    iteration=$((iteration + 1))
+    log INFO "CI check iteration ${iteration}/${MAX_CI_ITERATIONS}"
+
+    # ── Run all checks ──────────────────────────────────────────────────
+    local all_passed=true
+    local auto_fixable=""
+    local claude_fixable=""
+
+    for check_fn in $checks; do
+      local name="${check_fn#ci_check_}"
+      log INFO "Running check: ${name}..."
+      local exit_code=0
+      "$check_fn" > "${ci_tmp_dir}/${name}.out" 2>&1 || exit_code=$?
+
+      if [ $exit_code -ne 0 ]; then
+        all_passed=false
+        if _has_ci_fix "$name"; then
+          auto_fixable+="${name} "
+        else
+          claude_fixable+="${name} "
+        fi
+        log WARN "Check ${name}: FAIL"
+      else
+        log OK "Check ${name}: PASS"
+      fi
+    done
+
+    if [ "$all_passed" = true ]; then
+      log OK "All CI checks pass on iteration ${iteration}"
+      _jq_update --arg iters "$iteration" \
+        '.deterministic.ci_checks_results.final_status = "pass" |
+         .deterministic.ci_checks_results.iterations_needed = ($iters | tonumber)'
+      return 0
+    fi
+
+    local any_fixes_applied=false
+
+    # ── Auto-fix ────────────────────────────────────────────────────────
+    for name in $auto_fixable; do
+      log INFO "Auto-fixing: ${name}..."
+      "ci_fix_${name}" > /dev/null 2>&1 || true
+      any_fixes_applied=true
+
+      # Re-check to confirm the fix worked
+      local recheck_exit=0
+      "ci_check_${name}" > "${ci_tmp_dir}/${name}.out" 2>&1 || recheck_exit=$?
+      if [ $recheck_exit -ne 0 ]; then
+        log WARN "Auto-fix for ${name} did not fully resolve — promoting to Claude"
+        claude_fixable+="${name} "
+      else
+        log OK "Auto-fix resolved: ${name}"
+        _jq_update --arg n "$name" \
+          '.deterministic.ci_checks_results.auto_fixed += [$n] | .deterministic.ci_checks_results.auto_fixed |= unique'
+      fi
+    done
+
+    # ── Claude-fix ──────────────────────────────────────────────────────
+    if [ -n "${claude_fixable}" ]; then
+      local prompt
+      prompt="The following CI checks are failing after auto-fixes have been applied:\n\n"
+      for name in $claude_fixable; do
+        local truncated
+        truncated=$(tail -n 200 "${ci_tmp_dir}/${name}.out" 2>/dev/null || echo "(no output)")
+        prompt+="### ${name}\n\`\`\`\n${truncated}\n\`\`\`\n\n"
+      done
+      prompt+="Fix these issues in the source code. Do not change test expectations unless a test is genuinely wrong."
+
+      run_claude "$prompt"
+      any_fixes_applied=true
+
+      # Record Claude-fixed checks
+      for name in $claude_fixable; do
+        _jq_update --arg n "$name" \
+          '.deterministic.ci_checks_results.claude_fixed += [$n] | .deterministic.ci_checks_results.claude_fixed |= unique'
+      done
+    fi
+
+    # ── Re-run tests after any fixes ────────────────────────────────────
+    if [ "$any_fixes_applied" = true ]; then
+      log INFO "Re-running tests after CI fixes..."
+      if ! _run_all_suites; then
+        log WARN "CI fixes broke tests — asking Claude to fix..."
+        local truncated_test_output
+        truncated_test_output=$(echo "$LAST_TEST_OUTPUT" | tail -n 400)
+        run_claude "Your CI check fixes broke tests. Failed suites: ${LAST_FAILED_SUITES}
+
+\`\`\`
+${truncated_test_output}
+\`\`\`
+
+Fix the test failures without reverting the CI fixes. Adjust the implementation so both CI checks and tests pass."
+      fi
+    fi
+  done
+
+  _jq_update --arg iters "$MAX_CI_ITERATIONS" \
+    '.deterministic.ci_checks_results.final_status = "fail" |
+     .deterministic.ci_checks_results.iterations_needed = ($iters | tonumber)'
+  log ERROR "CI checks still failing after ${MAX_CI_ITERATIONS} iterations"
+  return 1
+}
+
+# ─── Quality Phase Functions ─────────────────────────────────────────────────
+# Each uses run_claude_fresh for its first call (with context pack), then
+# run_claude (--continue) for subsequent calls within the same phase.
+
+phase_skill_chain() {
+  local context
+  context=$(_build_context_pack "skill_chain")
+
+  # Coding review — first call starts fresh session with context pack
+  log INFO "Running coding review..."
+  run_claude_fresh "${context}
+
+---
+
+You are reviewing code changes in the ${PROJECT_NAME} project.
+
+Review all code in the changed files for:
+- Unnecessary complexity or abstraction
+- Missing error handling at system boundaries
+- Inconsistent naming or patterns compared to existing codebase
+${REVIEW_EXTRAS:+${REVIEW_EXTRAS}
+}Fix any issues you find."
+
+  # Security check — continues the skill_chain conversation
+  log INFO "Running security check..."
+  run_claude "Review all code in the changed files for security issues:
+- No secrets or API keys in source code
+- Input validation at system boundaries (user input, external APIs)
+- No XSS in rendered content
+- Proper auth checks on routes
+${SECURITY_EXTRAS:+${SECURITY_EXTRAS}
+}Fix any issues you find."
+
+  # Simplification — continues the skill_chain conversation
+  log INFO "Running simplification..."
+  run_claude "Review all code in the changed files for simplification:
+- Remove dead code, unused imports, commented-out blocks
+- Replace over-engineered abstractions with simpler alternatives
+- Ensure no file exceeds ${MAX_LOC} lines (excluding tests)
+- If a file exceeds ${MAX_LOC} lines, split it into focused modules
+Fix any issues you find."
+
+  # Extract structured findings so downstream phases (especially final) can
+  # surface specific issues, security assessment, and simplifications made.
+  _extract_skill_chain_findings
+
+  log OK "Skill chain complete"
+}
+
+phase_loc_enforcement() {
+  log INFO "LOC enforcement (max ${MAX_LOC} LOC, max ${MAX_REFACTOR_ROUNDS} rounds)"
+
+  local changed_files
+  changed_files="$(get_changed_files)"
+
+  if [ -z "$changed_files" ]; then
+    log OK "No changed files — skipping LOC enforcement"
+    return 0
+  fi
+
+  local context
+  context=$(_build_context_pack "loc_enforcement")
+
+  local round=0
+  local prev_long_files=""
+  local first_call=true
+
+  while [ $round -lt $MAX_REFACTOR_ROUNDS ]; do
+    round=$((round + 1))
+    local long_files
+    long_files="$(_find_long_files "$MAX_LOC" | _filter_to_changed "$changed_files")"
+
+    if [ -z "$long_files" ]; then
+      log OK "All session files within ${MAX_LOC} LOC limit"
+      return 0
+    fi
+
+    # Stale-detection: if the list is identical to last round, Claude couldn't
+    # (or chose not to) split these files. Break instead of looping forever.
+    if [ "$long_files" = "$prev_long_files" ]; then
+      log WARN "No progress since last round — these files could not be split further:"
+      echo "$long_files" | while IFS= read -r line; do
+        log WARN "  $line"
+      done
+      log WARN "Continuing to next phase."
+      return 0
+    fi
+    prev_long_files="$long_files"
+
+    log WARN "Session files exceeding ${MAX_LOC} LOC (round ${round}):"
+    echo "$long_files" | while IFS= read -r line; do
+      log WARN "  $line"
+    done
+
+    local refactor_prompt="The following files exceed ${MAX_LOC} lines of code:
+
+${long_files}
+
+Refactor each file:
+1. Extract logical units into separate modules
+2. Maintain all existing exports (no breaking changes)
+3. Update imports in dependent files
+4. Ensure tests still pass after refactoring
+
+If a file cannot be meaningfully split further (e.g. it is a thin orchestrator with re-exports), explain why and move on."
+
+    if [ "$first_call" = true ]; then
+      run_claude_fresh "${context}
+
+---
+
+${refactor_prompt}"
+      first_call=false
+    else
+      run_claude "$refactor_prompt"
+    fi
+
+    # Smoke test after refactor
+    if ! _run_all_suites; then
+      log ERROR "Tests broke during LOC refactoring on round ${round}"
+      run_claude "The refactoring broke tests. Fix the failures without reverting the split — adjust imports and references."
+    fi
+
+    # Refresh changed files — refactoring creates new files
+    changed_files="$(get_changed_files)"
+  done
+
+  log WARN "LOC enforcement incomplete after ${MAX_REFACTOR_ROUNDS} rounds"
+  return 1
+}
+
+phase_fresh_review() {
+  local changed_files
+  changed_files="$(get_changed_files)"
+
+  if [ -z "$changed_files" ]; then
+    log WARN "No changed files detected for review"
+    return 0
+  fi
+
+  local context
+  context=$(_build_context_pack "fresh_review")
+
+  # Fresh context — the reviewer has never seen this code and evaluates it cold.
+  # Context pack deliberately excludes plan_intent to avoid anchoring bias.
+  run_claude_fresh "${context}
+
+---
+
+You are reviewing code changes in the ${PROJECT_NAME} project. You did NOT write this code. Evaluate it objectively.
+
+${FRESH_REVIEW_PREAMBLE:+${FRESH_REVIEW_PREAMBLE}
+
+}These files were changed:
+${changed_files}
+
+Review each changed file for:
+
+${FRESH_REVIEW_EXTRAS:+${FRESH_REVIEW_EXTRAS}
+
+}1. **Correctness**
+   - Do the implementations match their test expectations?
+   - Are there edge cases not covered?
+   - Are error paths handled?
+
+2. **Code quality**
+   - Files over ${MAX_LOC} LOC?
+   - Unnecessary abstractions?
+   - Dead code or unused imports?
+   - Naming consistency with the rest of the codebase?
+
+3. **Security**
+   - Hardcoded secrets?
+   - Injection risks in queries?
+   - Unvalidated user input?
+
+Output a review in this format:
+
+## Fresh-Context Review
+
+### Issues Found (fix required)
+- [file:line] description
+
+### Warnings (consider fixing)
+- [file:line] description
+
+### Approved
+- [list of files that pass review]
+
+If issues are found, fix them now."
+
+  # Extract review findings into state so downstream phases (especially final)
+  # can surface warnings, limitations, and follow-up items. This continues the
+  # fresh_review session, so Claude has full context of what it found.
+  _extract_review_findings
+
+  log OK "Fresh-context review complete"
+}
+
+phase_doc_update() {
+  local changed_files
+  changed_files="$(get_changed_files)"
+
+  if [ -z "$changed_files" ]; then
+    log WARN "No changed files detected — skipping doc update"
+    return 0
+  fi
+
+  local context
+  context=$(_build_context_pack "doc_update")
+
+  local doc_body
+  if [ -n "${DOC_UPDATE_CONTEXT:-}" ]; then
+    doc_body="$DOC_UPDATE_CONTEXT"
+  else
+    doc_body="Update any documentation that references the changed files. Fix stale file paths, type signatures, and status tables."
+  fi
+
+  run_claude_fresh "${context}
+
+---
+
+You have finished implementing and reviewing code changes. Now update documentation to reflect what changed.
+
+These files were modified in this session:
+${changed_files}
+
+${doc_body}"
+
+  # Extract which docs were updated so the final summary can report them.
+  _extract_doc_update_summary
+
+  log OK "Documentation update complete"
+}
+
+phase_final() {
+  local context
+  context=$(_build_context_pack "final")
+
+  run_claude_fresh "${context}
+
+---
+
+Summarise what was implemented in this session.
+Output:
+1. List of files created or modified
+2. Step-by-step instructions for manually testing the feature from a user's perspective
+3. Any known limitations or follow-up work needed"
+
+  # ─── Auto-commit ──────────────────────────────────────────────────────────
+  # Stage all files changed during this pipeline run and commit them.
+  # Skips if no git repo, no changes, or tests didn't pass.
+  if [ "$HAS_GIT" = true ]; then
+    local test_status
+    test_status=$(_state_get '.deterministic.test_results.final_status // "unknown"')
+    if [ "$test_status" != "pass" ]; then
+      log WARN "Skipping auto-commit: tests status is '${test_status}', not 'pass'"
+    else
+      cd "$PROJECT_ROOT"
+      local changed_files
+      changed_files=$(get_changed_files)
+      if [ -z "$changed_files" ]; then
+        log WARN "Skipping auto-commit: no changed files detected"
+      else
+        # Stage changed files, excluding auto_claude runtime artifacts and gitignored paths.
+        # Uses sed instead of grep -v to avoid exit 1 on no match (bash 3.2 errtrace).
+        # git check-ignore filters out gitignored files so git add won't fail on them.
+        echo "$changed_files" | sed '/\.auto_claude/d; /\.claude\/plans\//d' | while IFS= read -r f; do
+          [ -n "$f" ] && [ -f "$PROJECT_ROOT/$f" ] && ! git check-ignore -q "$PROJECT_ROOT/$f" 2>/dev/null && git add "$PROJECT_ROOT/$f"
+        done
+
+        # Build commit message from state
+        local plan_intent impl_summary spec_basename branch_name
+        plan_intent=$(_state_get '.semantic.plan_intent // "Pipeline implementation"')
+        impl_summary=$(_state_get '.semantic.implementation_summary // empty')
+        spec_basename=$(basename "$SPEC_FILE" .md 2>/dev/null || echo "spec")
+        branch_name=$(git branch --show-current 2>/dev/null || echo "unknown")
+
+        # Truncate plan_intent to first sentence for the subject line
+        local subject
+        subject=$(echo "$plan_intent" | sed 's/\. .*//' | cut -c1-72)
+
+        local body=""
+        if [ -n "$impl_summary" ] && [ "$impl_summary" != "null" ]; then
+          body="$impl_summary"
+        fi
+
+        local commit_msg
+        if [ -n "$body" ]; then
+          commit_msg=$(printf '%s\n\n%s\n\nSpec: %s' \
+            "$subject" "$body" "$spec_basename")
+        else
+          commit_msg=$(printf '%s\n\nSpec: %s' \
+            "$subject" "$spec_basename")
+        fi
+
+        if git diff --cached --quiet 2>/dev/null; then
+          log WARN "Skipping auto-commit: nothing staged after filtering"
+        else
+          if git commit -m "$commit_msg" --no-verify 2>&1 | tee -a "$LOG_FILE"; then
+            local new_sha
+            new_sha=$(git rev-parse --short HEAD 2>/dev/null)
+            log OK "Committed: ${new_sha} on branch ${branch_name}"
+          else
+            log WARN "git commit failed — changes remain staged but uncommitted"
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  log OK "Pipeline complete"
+}
+
+# ─── Source Project Config ───────────────────────────────────────────────────
+
+CONF_FILE="${PROJECT_ROOT}/.auto_claude.conf"
+if [ -f "$CONF_FILE" ]; then
+  # shellcheck source=/dev/null
+  source "$CONF_FILE"
+else
+  echo "ERROR: No .auto_claude.conf found in ${PROJECT_ROOT}" >&2
+  echo "Create one with at least one test_suite_*() function." >&2
+  exit 1
+fi
+
+# ─── Validate Test Suites ───────────────────────────────────────────────────
+
+_startup_suites=$(_discover_test_suites)
+if [ -z "$_startup_suites" ]; then
+  echo "ERROR: No test_suite_*() functions found in ${CONF_FILE}" >&2
+  echo "Define at least one, e.g.:" >&2
+  echo '  test_suite_jest() { npm test 2>&1 | tee -a "$LOG_FILE"; return ${PIPESTATUS[0]}; }' >&2
+  exit 1
+fi
+
+log INFO "Discovered test suites:"
+for _s in $_startup_suites; do
+  log INFO "  - ${_s#test_suite_}"
+done
+unset _startup_suites _s
+
+# ─── Discover CI Checks ──────────────────────────────────────────────────────
+
+_auto_discover_ci_checks
+
+_startup_ci_checks=$(_discover_ci_checks)
+if [ -n "$_startup_ci_checks" ]; then
+  log INFO "Discovered CI checks:"
+  for _c in $_startup_ci_checks; do
+    _ci_name="${_c#ci_check_}"
+    _ci_strat="Claude-fixable"
+    _has_ci_fix "$_ci_name" && _ci_strat="auto-fixable"
+    log INFO "  - ${_ci_name} (${_ci_strat})"
+  done
+else
+  log INFO "No CI checks configured — ci_checks phase will be skipped"
+fi
+unset _startup_ci_checks _c _ci_name _ci_strat
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+main() {
+  local start_phase=1
+
+  # Check for existing state file from a crashed run
+  if [ -f "$STATE_FILE" ]; then
+    local run_status
+    run_status=$(_state_get '.run.status')
+
+    if [ "$run_status" = "running" ]; then
+      log WARN "Found interrupted pipeline state"
+
+      # Restore baseline commit from state
+      BASELINE_COMMIT=$(_state_get '.run.baseline_commit')
+      if [ -n "$BASELINE_COMMIT" ] && [ "$BASELINE_COMMIT" != "null" ]; then
+        log INFO "Baseline commit: ${BASELINE_COMMIT:0:12}..."
+      fi
+
+      # Find last completed phase and compute start_phase
+      local phase_idx=0
+      for phase_name in "${PHASES[@]}"; do
+        phase_idx=$((phase_idx + 1))
+        local pstatus
+        pstatus=$(_state_get ".phases.\"${phase_name}\".status // empty")
+        if [ "$pstatus" = "completed" ]; then
+          start_phase=$((phase_idx + 1))
+          # Track seam crossing
+          if [ "$phase_name" = "$SEAM_AFTER" ]; then
+            _PAST_SEAM=true
+          fi
+        fi
+      done
+
+      # Get session ID from the last recorded phase for resume
+      local last_session
+      last_session=$(_state_get '[.phases | to_entries[] | select(.value.session_id != "" and .value.session_id != null)] | last.value.session_id // empty')
+      if [ -n "$last_session" ] && [ "$last_session" != "null" ]; then
+        RESUME_SESSION_ID="$last_session"
+        log INFO "Resumable session: ${last_session:0:12}..."
+      fi
+
+      log INFO "Resuming from phase ${start_phase}"
+    else
+      # Previous run completed — start fresh
+      log INFO "Previous run completed. Starting fresh."
+      rm -f "$STATE_FILE"
+    fi
+  fi
+
+  # Fresh run — initialize state and baseline
+  if [ ! -f "$STATE_FILE" ]; then
+    if [ "$HAS_GIT" = true ]; then
+      BASELINE_COMMIT="$(git rev-parse HEAD 2>/dev/null)" || true
+      # Snapshot untracked files so we can subtract them later
+      git -C "$PROJECT_ROOT" ls-files --others --exclude-standard 2>/dev/null | sort > "$BASELINE_FILE"
+      log INFO "Baseline snapshot: commit ${BASELINE_COMMIT:0:12}..., $(wc -l < "$BASELINE_FILE" | tr -d ' ') untracked files"
+    fi
+    _init_state
+  fi
+
+  log INFO "Starting auto_claude pipeline"
+  log INFO "Project: ${PROJECT_NAME}"
+  log INFO "Spec: ${SPEC_FILE}"
+  log INFO "Log: ${LOG_FILE}"
+  log INFO "State: ${STATE_FILE}"
+  log INFO "Max LOC: ${MAX_LOC}"
+  log INFO "Max test iterations: ${MAX_TEST_ITERATIONS}"
+  log INFO "Phases: ${PHASES[*]}"
+  log INFO "Seam after: ${SEAM_AFTER}"
+
+  local phase_idx=0
+  for phase_name in "${PHASES[@]}"; do
+    phase_idx=$((phase_idx + 1))
+    if [ "$start_phase" -le "$phase_idx" ]; then
+      CURRENT_PHASE_NAME="$phase_name"
+      log INFO "═══ Phase ${phase_idx}/${#PHASES[@]}: ${phase_name} ═══"
+
+      _update_phase_status "$phase_name" "in_progress"
+
+      "phase_${phase_name}"
+
+      _update_phase_status "$phase_name" "completed"
+      _update_deterministic_state
+
+      # Run extraction at the authoring/quality seam (once)
+      if [ "$phase_name" = "$SEAM_AFTER" ] && [ "$_PAST_SEAM" = false ]; then
+        _extract_authoring_summary
+        _PAST_SEAM=true
+      fi
+
+      # Track completed quality phases in state for downstream context packs
+      if [ "$_PAST_SEAM" = true ] && [ "$phase_name" != "$SEAM_AFTER" ]; then
+        _jq_update --arg p "$phase_name" \
+          '.semantic.completed_quality_phases += [$p]'
+      fi
+    fi
+  done
+
+  # Mark run as completed, clean up transient files
+  _jq_update '.run.status = "completed"'
+  rm -f "$BASELINE_FILE"
+
+  log OK "═══ All ${#PHASES[@]} phases complete ═══"
+  log INFO "State: jq . ${STATE_FILE}"
+}
+
+_acquire_lock
+main "$@"

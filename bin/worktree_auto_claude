@@ -1,0 +1,1281 @@
+#!/opt/homebrew/bin/bash
+# worktree_auto_claude — Orchestrate parallel auto_claude runs across git worktrees
+#
+# Runs a sequence of auto_claude invocations where some steps execute in the
+# current worktree (sequential) and others fan out to parallel worktrees with
+# visible Terminal.app windows. After parallel runs complete, commits are
+# cherry-picked back to the main branch and worktrees are cleaned up.
+#
+# Usage: worktree_auto_claude [--dry-run] [config-file]
+#
+# Default config: .worktree_auto_claude.conf in current directory
+#
+# Requires: auto_claude (~/bin), jq, git, osascript (macOS Terminal.app)
+
+set -Eeuo pipefail
+
+# ─── Constants (all overridable in .worktree_auto_claude.conf) ───────────────
+POLL_INTERVAL=15       # seconds between completion polls
+STARTUP_TIMEOUT=60     # seconds to wait for auto_claude lock file
+SETUP_TIMEOUT=600      # seconds for setup_worktree hook (e.g. yarn install)
+PHASE_STALL_TIMEOUT=1800  # seconds with no phase change before marking run as stalled (30 min)
+POLL_GLOBAL_TIMEOUT=7200  # seconds before the entire poll loop gives up (2 hours)
+
+# ─── Globals ─────────────────────────────────────────────────────────────────
+PROJECT_ROOT=""
+MAIN_BRANCH=""
+WORKTREE_BASE=""
+LOG_FILE=""
+DRY_RUN=false
+CONF_FILE=""
+ORCH_STATE_FILE=""     # .worktree_auto_claude_state.json — orchestrator resume state
+REPORT_FILE=""         # .worktree_auto_claude_report.md — human-readable summary
+START_STEP=1           # 1-based index of the first step to execute (for resume)
+
+# Run registry — populated by define_run() calls in the config
+declare -a _ALL_RUNS=()
+declare -A _RUN_SPECS=()
+
+# Execution plan — populated in the config
+declare -a STEPS=()
+
+# Optional merge order — when parallel runs must be cherry-picked in a specific
+# sequence (e.g. frontend before backend because backend depends on frontend's
+# shared file changes). If not set, uses the order from the STEPS definition.
+# Set in config: MERGE_ORDER=("frontend" "backend")
+declare -a MERGE_ORDER=()
+
+# Runtime state for parallel runs
+declare -A _WT_PATHS=()
+declare -A _WT_BRANCHES=()
+declare -A _WT_PIDS=()
+declare -A _WT_STATUS=()       # pending | running | completed | crashed | launch_failed
+declare -A _WT_TEST_STATUS=()  # pass | fail | unknown
+declare -A _WT_COMMITS=()     # number of commits cherry-picked
+declare -A _WT_LAST_PHASE=()  # last observed phase per run (for stall detection)
+declare -A _WT_PHASE_SINCE=() # epoch when current phase was first seen
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+_log_ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+log() {
+  local level="$1"; shift
+  local msg="$*"
+  local ts
+  ts=$(_log_ts)
+
+  local color_reset='\033[0m'
+  local color
+  case "$level" in
+    OK)    color='\033[0;32m' ;;
+    WARN)  color='\033[0;33m' ;;
+    ERROR) color='\033[0;31m' ;;
+    *)     color='\033[0;36m' ;;  # INFO = cyan
+  esac
+
+  printf '%b[%s] [%s] %s%b\n' "$color" "$ts" "$level" "$msg" "$color_reset"
+
+  if [ -n "$LOG_FILE" ]; then
+    printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE"
+  fi
+}
+
+# ─── Config API ──────────────────────────────────────────────────────────────
+# These functions are called by the user's .worktree_auto_claude.conf
+
+define_run() {
+  local name="$1" spec="$2"
+  _ALL_RUNS+=("$name")
+  _RUN_SPECS["$name"]="$spec"
+}
+
+# Default setup_worktree — no-op. Override in config.
+setup_worktree() { :; }
+
+# ─── Argument Parsing ────────────────────────────────────────────────────────
+parse_args() {
+  CONF_FILE=".worktree_auto_claude.conf"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run)  DRY_RUN=true; shift ;;
+      -h|--help)  _usage; exit 0 ;;
+      *)
+        if [ -f "$1" ]; then
+          CONF_FILE="$1"
+        else
+          log ERROR "Unknown argument or file not found: $1"
+          _usage
+          exit 1
+        fi
+        shift ;;
+    esac
+  done
+
+  # Convert to absolute path
+  if [[ "$CONF_FILE" != /* ]]; then
+    CONF_FILE="$(pwd)/$CONF_FILE"
+  fi
+
+  if [ ! -f "$CONF_FILE" ]; then
+    log ERROR "Config file not found: $CONF_FILE"
+    _usage
+    exit 1
+  fi
+}
+
+_usage() {
+  cat <<'EOF'
+Usage: worktree_auto_claude [--dry-run] [config-file]
+
+  --dry-run     Print execution plan without creating worktrees or running anything
+  config-file   Path to .worktree_auto_claude.conf (default: current directory)
+
+Config format: see examples or docs.
+EOF
+}
+
+# ─── Initialization ─────────────────────────────────────────────────────────
+init() {
+  # Detect project root via git
+  PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    log ERROR "Not in a git repository"
+    exit 1
+  }
+
+  MAIN_BRANCH=$(git branch --show-current 2>/dev/null) || {
+    log ERROR "Cannot determine current branch (detached HEAD?)"
+    exit 1
+  }
+
+  # Worktrees go as siblings of the current worktree
+  WORKTREE_BASE=$(dirname "$PROJECT_ROOT")
+
+  # Log file in project root
+  LOG_FILE="${PROJECT_ROOT}/.worktree_auto_claude_$(date '+%Y%m%d_%H%M%S').log"
+  # Derive state/report filenames from the config filename so multiple
+  # pipelines can coexist in the same project without clobbering each other.
+  # e.g. .worktree_auto_claude.lung-cancer.conf → suffix "lung-cancer"
+  #      .worktree_auto_claude.conf              → suffix "" (default, no tag)
+  local conf_basename
+  conf_basename=$(basename "$CONF_FILE")
+  local conf_tag=""
+  # Strip leading .worktree_auto_claude. and trailing .conf
+  if [[ "$conf_basename" =~ ^\.?worktree_auto_claude\.(.+)\.conf$ ]]; then
+    conf_tag="${BASH_REMATCH[1]}"
+  fi
+
+  if [ -n "$conf_tag" ]; then
+    ORCH_STATE_FILE="${PROJECT_ROOT}/.worktree_auto_claude_state.${conf_tag}.json"
+    REPORT_FILE="${PROJECT_ROOT}/.worktree_auto_claude_report.${conf_tag}.md"
+    LOG_FILE="${PROJECT_ROOT}/.worktree_auto_claude_${conf_tag}_$(date '+%Y%m%d_%H%M%S').log"
+  else
+    ORCH_STATE_FILE="${PROJECT_ROOT}/.worktree_auto_claude_state.json"
+    REPORT_FILE="${PROJECT_ROOT}/.worktree_auto_claude_report.md"
+  fi
+
+  log INFO "Project root: $PROJECT_ROOT"
+  log INFO "Main branch: $MAIN_BRANCH"
+  log INFO "Worktree base: $WORKTREE_BASE"
+  log INFO "Config: $CONF_FILE"
+  log INFO "Log: $LOG_FILE"
+}
+
+# ─── Orchestrator State Persistence ─────────────────────────────────────────
+# Mirrors auto_claude's .auto_claude_state.json pattern: a single JSON file
+# that tracks which steps/runs completed, enabling resume after interruption.
+
+_orch_state_init() {
+  jq -n \
+    --arg conf "$CONF_FILE" \
+    --arg branch "$MAIN_BRANCH" \
+    --arg root "$PROJECT_ROOT" \
+    --arg started "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{
+      schema_version: 1,
+      run: {
+        config_file: $conf,
+        branch: $branch,
+        project_root: $root,
+        started_at: $started,
+        status: "running"
+      },
+      steps: {},
+      runs: {}
+    }' > "$ORCH_STATE_FILE"
+  log INFO "Orchestrator state initialized: $ORCH_STATE_FILE"
+}
+
+_orch_state_get() {
+  jq -r "$1" "$ORCH_STATE_FILE" 2>/dev/null
+}
+
+_orch_state_update() {
+  if ! jq "$@" "$ORCH_STATE_FILE" > "${ORCH_STATE_FILE}.tmp"; then
+    log WARN "State update failed"
+    rm -f "${ORCH_STATE_FILE}.tmp"
+    return 1
+  fi
+  mv "${ORCH_STATE_FILE}.tmp" "$ORCH_STATE_FILE"
+}
+
+_orch_state_mark_step() {
+  local step_idx="$1" status="$2"
+  _orch_state_update \
+    --arg idx "$step_idx" --arg s "$status" --arg t "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '.steps[$idx] = {status: $s, updated_at: $t}'
+}
+
+_orch_state_mark_run() {
+  local name="$1" status="$2" test_status="${3:-unknown}" commits="${4:-0}"
+  _orch_state_update \
+    --arg n "$name" --arg s "$status" --arg ts "$test_status" \
+    --arg c "$commits" --arg t "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '.runs[$n] = {status: $s, test_status: $ts, commits_cherry_picked: (if $c == "n/a" then null else ($c | tonumber) end), updated_at: $t}'
+}
+
+_orch_state_mark_complete() {
+  _orch_state_update --arg t "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '.run.status = "completed" | .run.completed_at = $t'
+}
+
+# Detect existing state and compute START_STEP for resume.
+# Returns 0 if resuming, 1 if starting fresh.
+_orch_state_try_resume() {
+  if [ ! -f "$ORCH_STATE_FILE" ]; then
+    return 1
+  fi
+
+  local run_status
+  run_status=$(_orch_state_get '.run.status')
+
+  if [ "$run_status" = "completed" ]; then
+    log INFO "Previous orchestration completed. Starting fresh."
+    rm -f "$ORCH_STATE_FILE"
+    return 1
+  fi
+
+  if [ "$run_status" != "running" ]; then
+    log WARN "Unknown state status '${run_status}'. Starting fresh."
+    rm -f "$ORCH_STATE_FILE"
+    return 1
+  fi
+
+  # Check config file matches
+  local saved_conf
+  saved_conf=$(_orch_state_get '.run.config_file // empty')
+  if [ -n "$saved_conf" ] && [ "$saved_conf" != "$CONF_FILE" ]; then
+    log WARN "State is from a different config: $(basename "$saved_conf")"
+    log WARN "Current config: $(basename "$CONF_FILE")"
+    log INFO "Starting fresh (config mismatch)"
+    rm -f "$ORCH_STATE_FILE"
+    return 1
+  fi
+
+  # Check branch matches
+  local saved_branch
+  saved_branch=$(_orch_state_get '.run.branch // empty')
+  if [ -n "$saved_branch" ] && [ "$saved_branch" != "$MAIN_BRANCH" ]; then
+    log WARN "State is from branch '${saved_branch}', now on '${MAIN_BRANCH}'"
+    log INFO "Starting fresh (branch mismatch)"
+    rm -f "$ORCH_STATE_FILE"
+    return 1
+  fi
+
+  # Find last completed step
+  START_STEP=1
+  local step_idx=0
+  for step in "${STEPS[@]}"; do
+    step_idx=$((step_idx + 1))
+    local step_status
+    step_status=$(_orch_state_get ".steps[\"${step_idx}\"].status // empty")
+    if [ "$step_status" = "completed" ]; then
+      START_STEP=$((step_idx + 1))
+    fi
+  done
+
+  # Restore per-run status from state for runs in incomplete steps
+  for name in "${_ALL_RUNS[@]}"; do
+    local saved_run_status
+    saved_run_status=$(_orch_state_get ".runs[\"${name}\"].status // empty")
+    if [ -n "$saved_run_status" ]; then
+      _WT_STATUS["$name"]="$saved_run_status"
+      _WT_TEST_STATUS["$name"]=$(_orch_state_get ".runs[\"${name}\"].test_status // \"unknown\"")
+      _WT_COMMITS["$name"]=$(_orch_state_get ".runs[\"${name}\"].commits_cherry_picked // 0")
+
+      # Restore worktree paths for parallel runs
+      local wt_branch="${MAIN_BRANCH}--wt-${name}"
+      local wt_path="${WORKTREE_BASE}/${wt_branch}"
+      _WT_BRANCHES["$name"]="$wt_branch"
+      _WT_PATHS["$name"]="$wt_path"
+    fi
+  done
+
+  if [ $START_STEP -gt ${#STEPS[@]} ]; then
+    log INFO "All steps completed in previous run. Starting fresh."
+    rm -f "$ORCH_STATE_FILE"
+    return 1
+  fi
+
+  log WARN "Resuming from step ${START_STEP} (${START_STEP} of ${#STEPS[@]})"
+  return 0
+}
+
+# ─── Validation ──────────────────────────────────────────────────────────────
+validate_config() {
+  local errors=0
+
+  # Check all runs have spec files
+  for name in "${_ALL_RUNS[@]}"; do
+    local spec="${_RUN_SPECS[$name]}"
+
+    # Resolve relative spec paths against project root
+    if [[ "$spec" != /* ]]; then
+      spec="${PROJECT_ROOT}/$spec"
+      _RUN_SPECS["$name"]="$spec"
+    fi
+
+    if [ ! -f "$spec" ]; then
+      log ERROR "Spec file not found for run '$name': $spec"
+      errors=$((errors + 1))
+    fi
+
+    # Check conf_body function exists
+    if ! declare -f "conf_body_${name}" >/dev/null 2>&1; then
+      log ERROR "No conf_body_${name}() function defined for run '$name'"
+      errors=$((errors + 1))
+    fi
+  done
+
+  # Check STEPS references valid runs
+  for step in "${STEPS[@]}"; do
+    local type="${step%%:*}"
+    local names_csv="${step#*:}"
+
+    if [[ "$type" != "sequential" && "$type" != "parallel" ]]; then
+      log ERROR "Invalid step type: '$type' (expected sequential or parallel)"
+      errors=$((errors + 1))
+      continue
+    fi
+
+    IFS=',' read -ra names <<< "$names_csv"
+    for name in "${names[@]}"; do
+      if [[ ! -v "_RUN_SPECS[$name]" ]]; then
+        log ERROR "Step references undefined run: '$name'"
+        errors=$((errors + 1))
+      fi
+    done
+  done
+
+  # Check auto_claude is available
+  if ! command -v auto_claude &>/dev/null; then
+    log ERROR "auto_claude not found in PATH"
+    errors=$((errors + 1))
+  fi
+
+  # Check jq is available
+  if ! command -v jq &>/dev/null; then
+    log ERROR "jq not found — install with: brew install jq"
+    errors=$((errors + 1))
+  fi
+
+  if [ $errors -gt 0 ]; then
+    log ERROR "Validation failed with $errors error(s)"
+    exit 1
+  fi
+
+  log OK "Config validated: ${#_ALL_RUNS[@]} runs, ${#STEPS[@]} steps"
+}
+
+# ─── Dry Run ─────────────────────────────────────────────────────────────────
+print_dry_run() {
+  echo ""
+  echo "═══ Worktree Auto-Claude — Dry Run ═══"
+  echo ""
+  echo "Branch: $MAIN_BRANCH"
+  echo ""
+
+  local step_num=0
+  for step in "${STEPS[@]}"; do
+    step_num=$((step_num + 1))
+    local type="${step%%:*}"
+    local names_csv="${step#*:}"
+    IFS=',' read -ra names <<< "$names_csv"
+
+    if [ "$type" = "sequential" ]; then
+      local name="${names[0]}"
+      local spec="${_RUN_SPECS[$name]}"
+      echo "Step ${step_num}: sequential — ${name}"
+      echo "  Spec: $(basename "$spec")"
+      echo "  Runs in: $PROJECT_ROOT (current worktree)"
+      echo ""
+
+    elif [ "$type" = "parallel" ]; then
+      echo "Step ${step_num}: parallel"
+      for name in "${names[@]}"; do
+        local spec="${_RUN_SPECS[$name]}"
+        local wt_branch="${MAIN_BRANCH}--wt-${name}"
+        local wt_path="${WORKTREE_BASE}/${wt_branch}"
+        echo "  ├── ${name}"
+        echo "  │   Spec: $(basename "$spec")"
+        echo "  │   Worktree: ${wt_path}"
+        echo "  │   Branch: ${wt_branch}"
+      done
+      echo ""
+    fi
+  done
+
+  echo "═══ End Dry Run ═══"
+}
+
+# ─── Worktree Management ────────────────────────────────────────────────────
+create_worktree() {
+  local name="$1"
+  local wt_branch="${MAIN_BRANCH}--wt-${name}"
+  local wt_path="${WORKTREE_BASE}/${wt_branch}"
+
+  _WT_BRANCHES["$name"]="$wt_branch"
+  _WT_PATHS["$name"]="$wt_path"
+
+  # Check if worktree already exists
+  if git worktree list --porcelain | grep -q "worktree ${wt_path}$"; then
+    log WARN "Worktree already exists: $wt_path — reusing"
+    return 0
+  fi
+
+  # Create branch from current HEAD (force to reset if it exists)
+  git branch -f "$wt_branch" HEAD 2>/dev/null || git branch "$wt_branch" HEAD
+
+  # Create the worktree
+  git worktree add "$wt_path" "$wt_branch" 2>&1 | while IFS= read -r line; do
+    log INFO "  git worktree: $line"
+  done
+
+  log OK "Created worktree: $name → $wt_path"
+}
+
+write_worktree_conf() {
+  local name="$1"
+  local wt_path="${_WT_PATHS[$name]}"
+  local conf_fn="conf_body_${name}"
+
+  "$conf_fn" > "${wt_path}/.auto_claude.conf"
+  log OK "Wrote .auto_claude.conf for ${name}"
+}
+
+run_setup_worktree() {
+  local name="$1"
+  local wt_path="${_WT_PATHS[$name]}"
+
+  # Check if setup_worktree was overridden (not the default no-op)
+  local fn_body
+  fn_body=$(declare -f setup_worktree)
+  if [[ "$fn_body" == *": ;"* ]] || [[ "$fn_body" == *":;"* ]]; then
+    log INFO "No setup_worktree hook — skipping for ${name}"
+    return 0
+  fi
+
+  log INFO "Running setup_worktree for ${name}..."
+  if timeout "$SETUP_TIMEOUT" bash -c "$(declare -f setup_worktree); setup_worktree '${wt_path}'" 2>&1 | tail -5; then
+    log OK "Setup complete for ${name}"
+  else
+    log ERROR "setup_worktree failed for ${name} (exit $?)"
+    return 1
+  fi
+}
+
+cleanup_worktree() {
+  local name="$1"
+  local wt_branch="${_WT_BRANCHES[$name]}"
+  local wt_path="${_WT_PATHS[$name]}"
+
+  # Remove worktree
+  if git worktree list --porcelain | grep -q "worktree ${wt_path}$"; then
+    git worktree remove "$wt_path" --force 2>/dev/null || {
+      log WARN "Could not remove worktree $wt_path — remove manually"
+      return 0
+    }
+  fi
+
+  # Delete temp branch
+  git branch -D "$wt_branch" 2>/dev/null || true
+
+  log OK "Cleaned up: ${name}"
+}
+
+# ─── Terminal Launch ─────────────────────────────────────────────────────────
+launch_terminal() {
+  local name="$1"
+  local wt_path="${_WT_PATHS[$name]}"
+  local spec="${_RUN_SPECS[$name]}"
+
+  _WT_STATUS["$name"]="launching"
+
+  # Launch in a new Terminal.app window
+  osascript <<EOF
+tell application "Terminal"
+  activate
+  do script "cd '${wt_path}' && echo '══ worktree_auto_claude: ${name} ══' && auto_claude '${spec}'; echo ''; echo '══ ${name} finished (exit \$?) ══'"
+end tell
+EOF
+
+  # Wait for auto_claude to start (lock file appears)
+  log INFO "Waiting for ${name} to start (up to ${STARTUP_TIMEOUT}s)..."
+  local elapsed=0
+  while [ ! -f "${wt_path}/.auto_claude.lock/pid" ] && [ $elapsed -lt $STARTUP_TIMEOUT ]; do
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  if [ -f "${wt_path}/.auto_claude.lock/pid" ]; then
+    local pid
+    pid=$(cat "${wt_path}/.auto_claude.lock/pid" 2>/dev/null || echo "")
+    _WT_PIDS["$name"]="$pid"
+    _WT_STATUS["$name"]="running"
+    log OK "Launched ${name} (PID: ${pid})"
+  else
+    _WT_STATUS["$name"]="launch_failed"
+    log ERROR "Failed to detect auto_claude startup for ${name} within ${STARTUP_TIMEOUT}s"
+  fi
+}
+
+# ─── Completion Detection ───────────────────────────────────────────────────
+poll_for_completion() {
+  local -a run_names=("$@")
+  local all_done=false
+  local poll_start
+  poll_start=$(date +%s)
+
+  log INFO "Polling ${#run_names[@]} parallel run(s) every ${POLL_INTERVAL}s..."
+  log INFO "Phase stall timeout: ${PHASE_STALL_TIMEOUT}s | Global timeout: ${POLL_GLOBAL_TIMEOUT}s"
+  echo ""
+
+  # Initialize phase tracking
+  local now
+  now=$(date +%s)
+  for name in "${run_names[@]}"; do
+    _WT_LAST_PHASE["$name"]=""
+    _WT_PHASE_SINCE["$name"]="$now"
+  done
+
+  while [ "$all_done" = false ]; do
+    all_done=true
+    now=$(date +%s)
+
+    # Global timeout check
+    local poll_elapsed=$(( now - poll_start ))
+    if [ $poll_elapsed -ge $POLL_GLOBAL_TIMEOUT ]; then
+      log ERROR "Global poll timeout reached (${POLL_GLOBAL_TIMEOUT}s). Aborting poll."
+      log ERROR "Active runs may still be running in their Terminal windows."
+      for name in "${run_names[@]}"; do
+        local s="${_WT_STATUS[$name]}"
+        if [[ "$s" != "completed" && "$s" != "crashed" && "$s" != "launch_failed" ]]; then
+          _WT_STATUS["$name"]="timed_out"
+          _WT_TEST_STATUS["$name"]="unknown"
+          log ERROR "  ${name}: marked timed_out"
+        fi
+      done
+      break
+    fi
+
+    for name in "${run_names[@]}"; do
+      # Skip already-resolved runs
+      local current="${_WT_STATUS[$name]}"
+      if [[ "$current" == "completed" || "$current" == "crashed" || "$current" == "launch_failed" || "$current" == "timed_out" ]]; then
+        continue
+      fi
+
+      local wt_path="${_WT_PATHS[$name]}"
+      local state_file="${wt_path}/.auto_claude_state.json"
+
+      # Signal 1: State file says completed
+      local run_status="unknown"
+      if [ -f "$state_file" ]; then
+        run_status=$(jq -r '.run.status // "unknown"' "$state_file" 2>/dev/null || echo "unknown")
+      fi
+
+      # Signal 2: Lock directory gone
+      local lock_exists=false
+      [ -d "${wt_path}/.auto_claude.lock" ] && lock_exists=true
+
+      # Signal 3: PID still alive
+      local pid="${_WT_PIDS[$name]:-}"
+      local pid_alive=false
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        pid_alive=true
+      fi
+
+      # Determine effective status
+      if [ "$run_status" = "completed" ]; then
+        _WT_STATUS["$name"]="completed"
+
+        # Capture test status
+        local test_status
+        test_status=$(jq -r '.deterministic.test_results.final_status // "unknown"' "$state_file" 2>/dev/null || echo "unknown")
+        _WT_TEST_STATUS["$name"]="$test_status"
+
+        log OK "${name}: completed (tests: ${test_status})"
+
+      elif [ "$pid_alive" = false ] && [ "$lock_exists" = false ] && [ "$run_status" != "unknown" ]; then
+        # Process exited without completing state — crashed
+        _WT_STATUS["$name"]="crashed"
+        _WT_TEST_STATUS["$name"]="unknown"
+        log ERROR "${name}: crashed (PID gone, lock released, state incomplete)"
+
+      else
+        # Still running
+        all_done=false
+
+        # Detect current phase for stall tracking
+        local current_phase="starting"
+        if [ -f "$state_file" ]; then
+          current_phase=$(jq -r '
+            [.phases | to_entries[] | select(.value.status == "in_progress") | .key] | first // "unknown"
+          ' "$state_file" 2>/dev/null || echo "unknown")
+        fi
+
+        # Phase stall detection: track how long we've been in the same phase
+        local last_phase="${_WT_LAST_PHASE[$name]:-}"
+        if [ "$current_phase" != "$last_phase" ]; then
+          # Phase changed — reset the timer
+          _WT_LAST_PHASE["$name"]="$current_phase"
+          _WT_PHASE_SINCE["$name"]="$now"
+          if [ -n "$last_phase" ]; then
+            log INFO "${name}: phase advanced → ${current_phase}"
+          fi
+        else
+          # Same phase — check for stall
+          local phase_elapsed=$(( now - ${_WT_PHASE_SINCE[$name]} ))
+          local phase_mins=$(( phase_elapsed / 60 ))
+
+          if [ $phase_elapsed -ge $PHASE_STALL_TIMEOUT ]; then
+            _WT_STATUS["$name"]="timed_out"
+            _WT_TEST_STATUS["$name"]="unknown"
+            log ERROR "${name}: STALLED on phase '${current_phase}' for ${phase_mins}m (limit: $((PHASE_STALL_TIMEOUT / 60))m)"
+            log ERROR "  Terminal window may still be active — check manually"
+            log ERROR "  Worktree: ${wt_path}"
+            continue
+          fi
+
+          # Warn at 50% and 75% of stall timeout
+          local warn_50=$(( PHASE_STALL_TIMEOUT / 2 ))
+          local warn_75=$(( PHASE_STALL_TIMEOUT * 3 / 4 ))
+          if [ $phase_elapsed -ge $warn_75 ] && [ $(( (phase_elapsed - POLL_INTERVAL) )) -lt $warn_75 ]; then
+            log WARN "${name}: phase '${current_phase}' stuck for ${phase_mins}m — stall timeout in $(( (PHASE_STALL_TIMEOUT - phase_elapsed) / 60 ))m"
+          elif [ $phase_elapsed -ge $warn_50 ] && [ $(( (phase_elapsed - POLL_INTERVAL) )) -lt $warn_50 ]; then
+            log WARN "${name}: phase '${current_phase}' running for ${phase_mins}m"
+          fi
+        fi
+
+        log INFO "${name}: running (phase: ${current_phase}, ${phase_mins:-0}m in phase)"
+      fi
+    done
+
+    if [ "$all_done" = false ]; then
+      sleep "$POLL_INTERVAL"
+    fi
+  done
+
+  echo ""
+  local timed_out_count=0
+  for name in "${run_names[@]}"; do
+    [ "${_WT_STATUS[$name]}" = "timed_out" ] && timed_out_count=$((timed_out_count + 1))
+  done
+
+  if [ $timed_out_count -gt 0 ]; then
+    log WARN "${timed_out_count} run(s) timed out — their Terminal windows may still be active"
+  fi
+  log OK "Poll loop finished"
+}
+
+# ─── Cherry-Pick Merge ──────────────────────────────────────────────────────
+cherry_pick_commits() {
+  local name="$1"
+  local wt_branch="${_WT_BRANCHES[$name]}"
+
+  # Only cherry-pick if tests passed
+  local test_status="${_WT_TEST_STATUS[$name]:-unknown}"
+  if [ "$test_status" != "pass" ]; then
+    log WARN "Skipping cherry-pick for ${name}: tests ${test_status}"
+    _WT_COMMITS["$name"]="0"
+    return 1
+  fi
+
+  # Find commits on worktree branch not on main branch
+  local commits
+  commits=$(git log "${MAIN_BRANCH}..${wt_branch}" --format="%H" --reverse 2>/dev/null || echo "")
+
+  if [ -z "$commits" ]; then
+    log WARN "No commits to cherry-pick from ${name}"
+    _WT_COMMITS["$name"]="0"
+    return 0
+  fi
+
+  cd "$PROJECT_ROOT"
+
+  local count=0
+  local failed=false
+  while IFS= read -r sha; do
+    [ -z "$sha" ] && continue
+    if git cherry-pick "$sha" --no-verify 2>&1; then
+      count=$((count + 1))
+      log OK "Cherry-picked ${sha:0:8} from ${name} (${count})"
+    else
+      log ERROR "Cherry-pick conflict for ${sha:0:8} from ${name}"
+      log ERROR "Resolve manually. Worktree preserved at: ${_WT_PATHS[$name]}"
+      git cherry-pick --abort 2>/dev/null || true
+      failed=true
+      break
+    fi
+  done <<< "$commits"
+
+  _WT_COMMITS["$name"]="$count"
+
+  if [ "$failed" = true ]; then
+    return 1
+  fi
+
+  log OK "Cherry-picked ${count} commit(s) from ${name}"
+}
+
+# ─── Execution ───────────────────────────────────────────────────────────────
+run_sequential_step() {
+  local name="$1"
+  local spec="${_RUN_SPECS[$name]}"
+
+  log INFO "═══ Sequential: ${name} ═══"
+
+  # Write the scoped .auto_claude.conf into the current project root
+  local existing_conf=""
+  if [ -f "${PROJECT_ROOT}/.auto_claude.conf" ]; then
+    existing_conf=$(cat "${PROJECT_ROOT}/.auto_claude.conf")
+  fi
+
+  # Write scoped conf
+  local conf_fn="conf_body_${name}"
+  "$conf_fn" > "${PROJECT_ROOT}/.auto_claude.conf"
+
+  log INFO "Running auto_claude for ${name}..."
+
+  # Run auto_claude directly (blocks until done)
+  local exit_code=0
+  (cd "$PROJECT_ROOT" && auto_claude "$spec") || exit_code=$?
+
+  # Restore original conf if there was one
+  if [ -n "$existing_conf" ]; then
+    echo "$existing_conf" > "${PROJECT_ROOT}/.auto_claude.conf"
+  else
+    rm -f "${PROJECT_ROOT}/.auto_claude.conf"
+  fi
+
+  if [ $exit_code -eq 0 ]; then
+    log OK "Sequential run ${name} completed successfully"
+  else
+    log ERROR "Sequential run ${name} failed (exit ${exit_code})"
+    return $exit_code
+  fi
+}
+
+run_parallel_group() {
+  local -a names=("$@")
+
+  log INFO "═══ Parallel group: ${names[*]} ═══"
+
+  # Resume detection: check which runs already completed (from a previous interrupted run).
+  # A run is already done if:
+  #   (a) Its worktree's .auto_claude_state.json shows status=completed, OR
+  #   (b) The orchestrator state has it marked as completed with commits already cherry-picked
+  local -a needs_run=()
+  local -a already_done=()
+  local -a needs_merge=()
+
+  for name in "${names[@]}"; do
+    local wt_branch="${MAIN_BRANCH}--wt-${name}"
+    local wt_path="${WORKTREE_BASE}/${wt_branch}"
+    _WT_BRANCHES["$name"]="$wt_branch"
+    _WT_PATHS["$name"]="$wt_path"
+
+    local saved_status="${_WT_STATUS[$name]:-}"
+    local saved_commits="${_WT_COMMITS[$name]:-0}"
+
+    # Case 1: Already completed AND cherry-picked in a previous run
+    if [ "$saved_status" = "completed" ] && [ "$saved_commits" != "0" ]; then
+      log OK "${name}: already completed and merged (resumed)"
+      already_done+=("$name")
+      continue
+    fi
+
+    # Case 2: Worktree exists and auto_claude finished there (but orchestrator was interrupted before merge)
+    local wt_state="${wt_path}/.auto_claude_state.json"
+    if [ -f "$wt_state" ]; then
+      local wt_run_status
+      wt_run_status=$(jq -r '.run.status // "unknown"' "$wt_state" 2>/dev/null || echo "unknown")
+      if [ "$wt_run_status" = "completed" ]; then
+        local wt_test_status
+        wt_test_status=$(jq -r '.deterministic.test_results.final_status // "unknown"' "$wt_state" 2>/dev/null || echo "unknown")
+        _WT_STATUS["$name"]="completed"
+        _WT_TEST_STATUS["$name"]="$wt_test_status"
+        _WT_COMMITS["$name"]="0"
+        log OK "${name}: auto_claude completed in worktree (tests: ${wt_test_status}) — will merge"
+        needs_merge+=("$name")
+        continue
+      fi
+    fi
+
+    # Case 3: Needs to run (fresh or previously failed/timed_out/crashed)
+    _WT_STATUS["$name"]="pending"
+    _WT_TEST_STATUS["$name"]="unknown"
+    _WT_COMMITS["$name"]="0"
+    needs_run+=("$name")
+  done
+
+  # Phase 1: Create worktrees and write configs (only for runs that need it)
+  local setup_failed=false
+  for name in "${needs_run[@]}"; do
+    if ! create_worktree "$name"; then
+      _WT_STATUS["$name"]="launch_failed"
+      setup_failed=true
+      continue
+    fi
+
+    if ! write_worktree_conf "$name"; then
+      _WT_STATUS["$name"]="launch_failed"
+      setup_failed=true
+      continue
+    fi
+  done
+
+  # Phase 2: Run setup hook in each worktree (e.g. yarn install)
+  for name in "${needs_run[@]}"; do
+    [ "${_WT_STATUS[$name]}" = "launch_failed" ] && continue
+    if ! run_setup_worktree "$name"; then
+      _WT_STATUS["$name"]="launch_failed"
+      setup_failed=true
+    fi
+  done
+
+  # Phase 3: Launch Terminal windows
+  local launched=()
+  for name in "${needs_run[@]}"; do
+    [ "${_WT_STATUS[$name]}" = "launch_failed" ] && continue
+    launch_terminal "$name"
+    if [ "${_WT_STATUS[$name]}" = "running" ]; then
+      launched+=("$name")
+    fi
+  done
+
+  # Phase 4: Poll for completion (only if we launched anything new)
+  if [ ${#launched[@]} -gt 0 ]; then
+    poll_for_completion "${launched[@]}"
+  elif [ ${#needs_run[@]} -gt 0 ]; then
+    log ERROR "No parallel runs launched successfully"
+    return 1
+  fi
+
+  # Phase 5: Cherry-pick commits back to main branch
+  # Merge order matters — parallel branches forked from the same commit, so if
+  # they touch overlapping files, cherry-pick order determines conflict behavior.
+  # Use MERGE_ORDER if set, otherwise fall back to the names array (config order).
+  log INFO "═══ Merging results ═══"
+  local any_cherry_pick_failed=false
+  local -a merge_sequence=()
+
+  if [ ${#MERGE_ORDER[@]} -gt 0 ]; then
+    # Use explicit merge order, filtering to only runs that are ready to merge
+    for name in "${MERGE_ORDER[@]}"; do
+      # Check this name is part of the current parallel group
+      local in_group=false
+      for gname in "${names[@]}"; do
+        [ "$gname" = "$name" ] && in_group=true && break
+      done
+      [ "$in_group" = true ] && merge_sequence+=("$name")
+    done
+    # Append any runs not in MERGE_ORDER (safety net)
+    for name in "${names[@]}"; do
+      local already_listed=false
+      for mname in "${merge_sequence[@]}"; do
+        [ "$mname" = "$name" ] && already_listed=true && break
+      done
+      [ "$already_listed" = false ] && merge_sequence+=("$name")
+    done
+    log INFO "Using explicit MERGE_ORDER: ${merge_sequence[*]}"
+  else
+    merge_sequence=("${names[@]}")
+    log INFO "Using config order: ${merge_sequence[*]}"
+  fi
+
+  for name in "${merge_sequence[@]}"; do
+    if [ "${_WT_STATUS[$name]}" = "completed" ]; then
+      cherry_pick_commits "$name" || any_cherry_pick_failed=true
+    fi
+  done
+
+  # Phase 6: Cleanup — only for fully merged worktrees
+  log INFO "═══ Cleanup ═══"
+  for name in "${names[@]}"; do
+    local commits="${_WT_COMMITS[$name]:-0}"
+    local status="${_WT_STATUS[$name]}"
+
+    if [ "$status" = "completed" ] && [ "${_WT_TEST_STATUS[$name]}" = "pass" ] && [ "$commits" != "0" ]; then
+      cleanup_worktree "$name"
+    elif [ "$status" = "launch_failed" ]; then
+      # Clean up worktrees that failed to launch
+      cleanup_worktree "$name" 2>/dev/null || true
+    elif [[ " ${already_done[*]:-} " == *" $name "* ]]; then
+      # Already merged in a previous run — skip
+      :
+    else
+      log WARN "Preserving worktree for ${name} (status: ${status}, tests: ${_WT_TEST_STATUS[$name]:-unknown})"
+      log WARN "  Path: ${_WT_PATHS[$name]:-unknown}"
+    fi
+  done
+
+  if [ "$any_cherry_pick_failed" = true ]; then
+    return 1
+  fi
+}
+
+execute_plan() {
+  local step_idx=0
+  for step in "${STEPS[@]}"; do
+    step_idx=$((step_idx + 1))
+    local type="${step%%:*}"
+    local names_csv="${step#*:}"
+    IFS=',' read -ra names <<< "$names_csv"
+
+    # Skip completed steps (resume support)
+    if [ $step_idx -lt $START_STEP ]; then
+      log INFO "Step ${step_idx}: skipped (completed in previous run)"
+      continue
+    fi
+
+    _orch_state_mark_step "$step_idx" "in_progress"
+
+    if [ "$type" = "sequential" ]; then
+      if run_sequential_step "${names[0]}"; then
+        _orch_state_mark_run "${names[0]}" "completed" "n/a" "n/a"
+        _orch_state_mark_step "$step_idx" "completed"
+      else
+        _orch_state_mark_run "${names[0]}" "failed" "n/a" "0"
+        _orch_state_mark_step "$step_idx" "failed"
+        log ERROR "Sequential step '${names[0]}' failed — aborting pipeline"
+        return 1
+      fi
+
+    elif [ "$type" = "parallel" ]; then
+      run_parallel_group "${names[@]}" || {
+        log WARN "Parallel group had failures — check summary"
+      }
+
+      # Persist per-run results to state
+      for name in "${names[@]}"; do
+        _orch_state_mark_run "$name" \
+          "${_WT_STATUS[$name]:-unknown}" \
+          "${_WT_TEST_STATUS[$name]:-unknown}" \
+          "${_WT_COMMITS[$name]:-0}"
+      done
+
+      # Mark step completed if at least one run succeeded
+      local any_success=false
+      for name in "${names[@]}"; do
+        if [ "${_WT_STATUS[$name]}" = "completed" ]; then
+          any_success=true
+          break
+        fi
+      done
+
+      if [ "$any_success" = true ]; then
+        _orch_state_mark_step "$step_idx" "completed"
+      else
+        _orch_state_mark_step "$step_idx" "failed"
+      fi
+    fi
+  done
+}
+
+# ─── Markdown Report ──────────────────────────────────────────────────────────
+# Generates a single .md file concatenating review findings from every run's
+# .auto_claude_state.json — gives a full picture at a glance.
+
+generate_report() {
+  local report="$REPORT_FILE"
+  local config_basename
+  config_basename=$(basename "$CONF_FILE")
+  local branch="$MAIN_BRANCH"
+  local timestamp
+  timestamp=$(date '+%Y-%m-%d %H:%M')
+
+  {
+    echo "# Worktree Auto-Claude Report"
+    echo ""
+    echo "**Config:** \`${config_basename}\`  "
+    echo "**Branch:** \`${branch}\`  "
+    echo "**Generated:** ${timestamp}"
+    echo ""
+
+    # Overview table
+    echo "## Run Summary"
+    echo ""
+    echo "| Run | Status | Tests | Commits | Notes |"
+    echo "|-----|--------|-------|---------|-------|"
+
+    for step in "${STEPS[@]}"; do
+      local names_csv="${step#*:}"
+      IFS=',' read -ra names <<< "$names_csv"
+      for name in "${names[@]}"; do
+        local status="${_WT_STATUS[$name]:-n/a}"
+        local tests="${_WT_TEST_STATUS[$name]:-n/a}"
+        local commits="${_WT_COMMITS[$name]:-n/a}"
+        local type="${step%%:*}"
+        local notes=""
+        if [ "$type" = "sequential" ]; then notes="sequential"
+        elif [ "$status" = "completed" ] && [ "$tests" = "pass" ] && [ "$commits" != "0" ]; then notes="merged"
+        elif [ "$status" = "completed" ] && [ "$tests" != "pass" ]; then notes="worktree preserved"
+        elif [ "$status" = "crashed" ]; then notes="worktree preserved"
+        elif [ "$status" = "timed_out" ]; then notes="STALLED"
+        fi
+        echo "| ${name} | ${status} | ${tests} | ${commits} | ${notes} |"
+      done
+    done
+
+    echo ""
+    echo "---"
+    echo ""
+
+    # Per-run detail sections — pull from each run's .auto_claude_state.json
+    for step in "${STEPS[@]}"; do
+      local names_csv="${step#*:}"
+      IFS=',' read -ra names <<< "$names_csv"
+      for name in "${names[@]}"; do
+        echo "## Run: \`${name}\`"
+        echo ""
+
+        # Determine state file path — parallel runs have worktree paths,
+        # sequential runs use PROJECT_ROOT
+        local state_file=""
+        local wt_path="${_WT_PATHS[$name]:-}"
+        if [ -n "$wt_path" ] && [ -f "${wt_path}/.auto_claude_state.json" ]; then
+          state_file="${wt_path}/.auto_claude_state.json"
+        elif [ -f "${PROJECT_ROOT}/.auto_claude_state.json" ]; then
+          state_file="${PROJECT_ROOT}/.auto_claude_state.json"
+        fi
+
+        if [ -z "$state_file" ] || [ ! -f "$state_file" ]; then
+          echo "_No state file found — run may not have started._"
+          echo ""
+          echo "---"
+          echo ""
+          continue
+        fi
+
+        # Implementation summary
+        local impl_summary
+        impl_summary=$(jq -r '.semantic.implementation_summary // empty' "$state_file" 2>/dev/null || true)
+        if [ -n "$impl_summary" ]; then
+          echo "### Implementation Summary"
+          echo ""
+          echo "$impl_summary"
+          echo ""
+        fi
+
+        # Review findings
+        local review_raw
+        review_raw=$(jq -r '.semantic.review_findings // empty' "$state_file" 2>/dev/null || true)
+        if [ -n "$review_raw" ]; then
+          echo "### Review Findings"
+          echo ""
+          # review_findings may be a JSON object or a string — handle both
+          local is_json
+          is_json=$(echo "$review_raw" | jq -e 'type' 2>/dev/null || echo "not_json")
+          if [ "$is_json" = "\"object\"" ]; then
+            local issues
+            issues=$(echo "$review_raw" | jq -r '.issues_fixed[]? // empty' 2>/dev/null || true)
+            if [ -n "$issues" ]; then
+              echo "**Issues fixed:**"
+              echo "$issues" | while IFS= read -r line; do echo "- ${line}"; done
+              echo ""
+            fi
+            local warnings
+            warnings=$(echo "$review_raw" | jq -r '.warnings[]? // empty' 2>/dev/null || true)
+            if [ -n "$warnings" ]; then
+              echo "**Warnings:**"
+              echo "$warnings" | while IFS= read -r line; do echo "- ${line}"; done
+              echo ""
+            fi
+            local approved
+            approved=$(echo "$review_raw" | jq -r '.approved_files[]? // empty' 2>/dev/null || true)
+            if [ -n "$approved" ]; then
+              echo "**Approved files:**"
+              echo "$approved" | while IFS= read -r line; do echo "- \`${line}\`"; done
+              echo ""
+            fi
+          else
+            echo "$review_raw"
+            echo ""
+          fi
+        fi
+
+        # Skill chain findings (code review)
+        local skill_chain
+        skill_chain=$(jq -r '.semantic.skill_chain_findings // empty' "$state_file" 2>/dev/null || true)
+        if [ -n "$skill_chain" ]; then
+          echo "### Code Review"
+          echo ""
+          echo "$skill_chain"
+          echo ""
+        fi
+
+        # Files changed
+        local files_changed
+        files_changed=$(jq -r '.deterministic.files_changed[]? // empty' "$state_file" 2>/dev/null || true)
+        if [ -n "$files_changed" ]; then
+          echo "### Files Changed"
+          echo ""
+          echo "$files_changed" | while IFS= read -r line; do echo "- \`${line}\`"; done
+          echo ""
+        fi
+
+        # Test results
+        local test_final
+        test_final=$(jq -r '.deterministic.test_results.final_status // "unknown"' "$state_file" 2>/dev/null || echo "unknown")
+        local test_suites
+        test_suites=$(jq -r '.deterministic.test_results.suites // {} | to_entries[] | "\(.key): \(.value.status // "unknown")"' "$state_file" 2>/dev/null || true)
+        if [ -n "$test_suites" ]; then
+          echo "### Test Results (${test_final})"
+          echo ""
+          echo "$test_suites" | while IFS= read -r line; do echo "- ${line}"; done
+          echo ""
+        fi
+
+        echo "---"
+        echo ""
+      done
+    done
+
+    echo "_Report: \`${report}\`_  "
+    echo "_State: \`${ORCH_STATE_FILE}\`_"
+
+  } > "$report"
+
+  log OK "Report generated: $report"
+}
+
+# ─── Summary ─────────────────────────────────────────────────────────────────
+report_summary() {
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════"
+  echo "  Worktree Auto-Claude — Summary"
+  echo "═══════════════════════════════════════════════════════════════"
+  echo ""
+
+  printf '  %-15s %-12s %-8s %-10s %s\n' "Run" "Status" "Tests" "Commits" "Notes"
+  printf '  %-15s %-12s %-8s %-10s %s\n' "───────────────" "────────────" "────────" "──────────" "─────"
+
+  for step in "${STEPS[@]}"; do
+    local names_csv="${step#*:}"
+    IFS=',' read -ra names <<< "$names_csv"
+
+    for name in "${names[@]}"; do
+      local status="${_WT_STATUS[$name]:-n/a}"
+      local tests="${_WT_TEST_STATUS[$name]:-n/a}"
+      local commits="${_WT_COMMITS[$name]:-n/a}"
+      local type="${step%%:*}"
+      local notes=""
+
+      if [ "$type" = "sequential" ]; then
+        notes="(sequential)"
+      elif [ "$status" = "completed" ] && [ "$tests" = "pass" ] && [ "$commits" != "0" ]; then
+        notes="merged"
+      elif [ "$status" = "completed" ] && [ "$tests" != "pass" ]; then
+        notes="worktree preserved"
+      elif [ "$status" = "crashed" ]; then
+        notes="worktree preserved"
+      elif [ "$status" = "timed_out" ]; then
+        notes="STALLED — check Terminal window"
+      fi
+
+      printf '  %-15s %-12s %-8s %-10s %s\n' "$name" "$status" "$tests" "$commits" "$notes"
+    done
+  done
+
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════"
+  echo ""
+}
+
+# ─── Signal Handling ─────────────────────────────────────────────────────────
+_on_interrupt() {
+  echo ""
+  log WARN "Interrupted by user"
+
+  # Persist current run status to state so we can resume
+  if [ -f "$ORCH_STATE_FILE" ]; then
+    for name in "${_ALL_RUNS[@]}"; do
+      local status="${_WT_STATUS[$name]:-}"
+      if [ -n "$status" ]; then
+        _orch_state_mark_run "$name" \
+          "$status" \
+          "${_WT_TEST_STATUS[$name]:-unknown}" \
+          "${_WT_COMMITS[$name]:-0}" 2>/dev/null || true
+      fi
+    done
+    log WARN "State saved — re-run the same command to resume"
+  fi
+
+  log WARN "Parallel runs may still be active in their Terminal windows:"
+  for name in "${_ALL_RUNS[@]}"; do
+    local pid="${_WT_PIDS[$name]:-}"
+    local path="${_WT_PATHS[$name]:-}"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      log WARN "  ${name}: PID ${pid} at ${path}"
+    fi
+  done
+
+  log WARN "Terminal windows are NOT killed — inspect and close manually"
+  exit 130
+}
+
+trap _on_interrupt INT TERM
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+main() {
+  parse_args "$@"
+  init
+
+  # Source the config — this populates _ALL_RUNS, _RUN_SPECS, STEPS, and defines conf_body_*()
+  # shellcheck source=/dev/null
+  source "$CONF_FILE"
+
+  validate_config
+
+  if [ "$DRY_RUN" = true ]; then
+    print_dry_run
+    exit 0
+  fi
+
+  # Resume detection — check for interrupted state from a previous run
+  if _orch_state_try_resume; then
+    log INFO "Resuming orchestration pipeline"
+  else
+    _orch_state_init
+    log INFO "Starting fresh orchestration pipeline"
+  fi
+
+  local start_time
+  start_time=$(date +%s)
+
+  execute_plan
+  _orch_state_mark_complete
+  report_summary
+  generate_report
+
+  local elapsed=$(( $(date +%s) - start_time ))
+  local mins=$(( elapsed / 60 ))
+  local secs=$(( elapsed % 60 ))
+  log OK "Pipeline finished in ${mins}m ${secs}s"
+  log INFO "State: $ORCH_STATE_FILE"
+  log INFO "Report: $REPORT_FILE"
+  open "$REPORT_FILE" 2>/dev/null || true
+}
+
+main "$@"
