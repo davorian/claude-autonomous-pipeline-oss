@@ -53,7 +53,7 @@ MAX_REFACTOR_ROUNDS=10
 MAX_LOC=300
 MAX_CI_ITERATIONS=3
 SUITE_IDLE_TIMEOUT=120  # seconds of no new output before killing a suite; 0 = no timeout
-PHASES=(plan decisions implement test_fix ci_checks impact skill_chain loc_enforcement fresh_review doc_update final)
+PHASES=(plan decisions test_intent pattern_baseline implement test_fix ci_checks impact skill_chain loc_enforcement fresh_review doc_update final)
 
 # Tiered escalation thresholds. Each value is the iteration where a new tier begins.
 # Tier 1 (tactical):  iterations 1 to TIER_2_AT-1
@@ -527,6 +527,66 @@ _init_state() {
     }' > "$STATE_FILE"
 
   log INFO "State file initialized: $STATE_FILE"
+}
+
+# ─── Ownership Manifest ─────────────────────────────────────────────────────
+#
+# When running inside a worktree fork (worktree_auto_claude), an ownership
+# manifest maps this run to the files it owns, may read, and must not touch.
+# In standalone mode (no manifest or no env var), all are empty — no enforcement.
+
+OWNERSHIP_OWNS=""
+OWNERSHIP_READS=""
+OWNERSHIP_MUST_NOT_TOUCH=""
+
+_load_ownership_manifest() {
+  local manifest="${PROJECT_ROOT}/.auto_claude_ownership.json"
+  if [ ! -f "$manifest" ]; then
+    return 0
+  fi
+
+  local run_name="${AUTO_CLAUDE_RUN_NAME:-}"
+  if [ -z "$run_name" ]; then
+    log INFO "Ownership manifest found but AUTO_CLAUDE_RUN_NAME not set — standalone mode"
+    return 0
+  fi
+
+  local entry
+  entry=$(jq -r --arg name "$run_name" '.runs[$name] // empty' "$manifest" 2>/dev/null)
+  if [ -z "$entry" ]; then
+    log WARN "Ownership manifest has no entry for run '${run_name}'"
+    return 0
+  fi
+
+  OWNERSHIP_OWNS=$(echo "$entry" | jq -r '(.owns // [])[]' 2>/dev/null) || true
+  OWNERSHIP_READS=$(echo "$entry" | jq -r '(.reads // [])[]' 2>/dev/null) || true
+  OWNERSHIP_MUST_NOT_TOUCH=$(echo "$entry" | jq -r '(.must_not_touch // [])[]' 2>/dev/null) || true
+
+  local own_count read_count fence_count
+  own_count=$(echo "$OWNERSHIP_OWNS" | grep -c . 2>/dev/null || echo 0)
+  read_count=$(echo "$OWNERSHIP_READS" | grep -c . 2>/dev/null || echo 0)
+  fence_count=$(echo "$OWNERSHIP_MUST_NOT_TOUCH" | grep -c . 2>/dev/null || echo 0)
+  log INFO "Ownership loaded: ${own_count} owned, ${read_count} read-only, ${fence_count} fenced"
+}
+
+_build_ownership_context() {
+  if [ -z "$OWNERSHIP_OWNS" ] && [ -z "$OWNERSHIP_READS" ] && [ -z "$OWNERSHIP_MUST_NOT_TOUCH" ]; then
+    return 0
+  fi
+
+  local owns_list reads_list fence_list
+  owns_list=$(echo "$OWNERSHIP_OWNS" | sed '/^$/d' | sed 's/^/  - /') || true
+  reads_list=$(echo "$OWNERSHIP_READS" | sed '/^$/d' | sed 's/^/  - /') || true
+  fence_list=$(echo "$OWNERSHIP_MUST_NOT_TOUCH" | sed '/^$/d' | sed 's/^/  - /') || true
+
+  echo "## File Ownership Boundaries
+You OWN (read-write):
+${owns_list:-  (none)}
+You may READ (read-only):
+${reads_list:-  (none)}
+You MUST NOT TOUCH:
+${fence_list:-  (none)}
+If you need a change in a read-only or fenced file, add a \`// TODO(boundary): <description of what you need>\` comment in the closest owned file. Do NOT modify files in the MUST NOT TOUCH list."
 }
 
 # Read a value from the state file via jq expression.
@@ -1100,12 +1160,17 @@ Output ONLY valid JSON (no markdown fences, no commentary). Use these exact fiel
 _extract_skill_chain_findings() {
   log INFO "Extracting skill chain findings..."
 
-  run_claude "Summarise the code review, security review, and simplification you just completed as structured JSON.
+  run_claude "Summarise the code review, pattern conformance, security review, and simplification you just completed as structured JSON.
 
 Output ONLY valid JSON (no markdown fences, no commentary). Use these exact fields:
 
 {
   \"code_review_issues\": [\"brief description of each code quality issue found and fixed\"],
+  \"pattern_conformance\": {
+    \"deviations_reverted\": [\"brief description of each reverted deviation\"],
+    \"deviations_kept\": [\"brief description of each kept deviation with rationale\"],
+    \"patterns_conformed\": [\"list of pattern areas that conform\"]
+  },
   \"security_assessment\": \"1-2 sentence summary of security findings (issues found or verified clean)\",
   \"simplifications\": [\"brief description of each simplification made\"],
   \"verified_clean\": [\"aspects verified with no issues (e.g. layer boundaries, naming, error handling)\"]
@@ -1467,34 +1532,26 @@ _extract_conformance_findings() {
   log INFO "Extracting conformance findings..."
 
   local parsed=""
-  if parsed=$(echo "$LAST_RESPONSE_TEXT" | jq '.' 2>/dev/null); then
-    _jq_update --argjson c "$parsed" '.semantic.conformance_findings = $c'
-    _ensure_explain_dir
-    echo "$parsed" > "$EXPLAIN_DIR/conformance_findings.json"
-    log OK "Conformance findings saved to state"
+  if parsed=$(_extract_json_from_response); then
+    if [ -n "$parsed" ]; then
+      _jq_update --argjson c "$parsed" '.semantic.conformance_findings = $c'
+      _ensure_explain_dir
+      echo "$parsed" > "$EXPLAIN_DIR/conformance_findings.json"
+      log OK "Conformance findings saved to state"
 
-    # Log per-pattern summary
-    local summary
-    summary=$(echo "$parsed" | jq -r '
-      ([ (.conforms // [])[] | "  ✓ " + . + ": conforms" ] | join("\n")) +
-      "\n" +
-      ([ (.deviations // [])[] |
-        "  ✗ " + .area + ": DEVIATION → verdict: " + .verdict +
-        (if .verdict == "revert" then " → reverted" else " (documented)" end)
-      ] | join("\n"))
-    ' 2>/dev/null) || summary=""
-    [ -n "$summary" ] && log INFO "Pattern conformance:\n${summary}"
-    return 0
-  fi
-
-  local extracted
-  extracted=$(echo "$LAST_RESPONSE_TEXT" | sed -n '/^```\(json\)\{0,1\}$/,/^```$/p' | sed '1d;$d')
-  if [ -n "$extracted" ] && parsed=$(echo "$extracted" | jq '.' 2>/dev/null); then
-    _jq_update --argjson c "$parsed" '.semantic.conformance_findings = $c'
-    _ensure_explain_dir
-    echo "$parsed" > "$EXPLAIN_DIR/conformance_findings.json"
-    log OK "Conformance findings saved to state (from markdown fence)"
-    return 0
+      # Log per-pattern summary
+      local summary
+      summary=$(echo "$parsed" | jq -r '
+        ([ (.conforms // [])[] | "  ✓ " + . + ": conforms" ] | join("\n")) +
+        "\n" +
+        ([ (.deviations // [])[] |
+          "  ✗ " + .area + ": DEVIATION → verdict: " + .verdict +
+          (if .verdict == "revert" then " → reverted" else " (documented)" end)
+        ] | join("\n"))
+      ' 2>/dev/null) || summary=""
+      [ -n "$summary" ] && log INFO "Pattern conformance:\n${summary}"
+      return 0
+    fi
   fi
 
   log WARN "Could not parse conformance findings"
@@ -2264,9 +2321,14 @@ phase_plan() {
   local spec_content
   spec_content="$(cat "$SPEC_FILE")"
 
+  local ownership_context=""
+  ownership_context=$(_build_ownership_context)
+
   local plan_prompt="You are working on the ${PROJECT_NAME} project.
 
 ${PLAN_CONTEXT:+${PLAN_CONTEXT}
+
+}${ownership_context:+${ownership_context}
 
 }Read this feature spec and create a detailed implementation plan:
 
@@ -2372,11 +2434,225 @@ Output ONLY valid JSON (no markdown fences, no commentary before or after):
   fi
 }
 
+phase_test_intent() {
+  if [ "${TDD_ENABLED}" != "true" ]; then
+    log INFO "TDD disabled — skipping test_intent phase"
+    return 0
+  fi
+
+  if [ ! -f "$SPEC_FILE" ]; then
+    log WARN "No spec file — skipping test_intent phase"
+    return 0
+  fi
+
+  local spec_content
+  spec_content="$(cat "$SPEC_FILE")"
+
+  # Read decisions manifest if available
+  local decisions_section=""
+  local decisions_raw
+  decisions_raw=$(_state_get '.semantic.decisions_manifest // empty')
+  if [ -n "$decisions_raw" ] && [ "$decisions_raw" != "null" ]; then
+    local formatted
+    formatted=$(echo "$decisions_raw" | jq -r '
+      [ (.deliverables // [])[] |
+        .title + ":\n" +
+        ([ (.decisions // [])[] | "  - " + .choice + " (" + .rationale + ")" ] | join("\n"))
+      ] | join("\n\n")
+    ' 2>/dev/null) || formatted=""
+    if [ -n "$formatted" ]; then
+      decisions_section="DECISIONS:
+${formatted}
+
+"
+    fi
+  fi
+
+  run_claude "You have a plan and decisions. Before implementing, write TESTS ONLY that
+encode the acceptance criteria from the spec.
+
+SPEC:
+${spec_content}
+
+${decisions_section}Write tests for these layers: ${TDD_LAYERS}
+
+Rules:
+- Write ONLY test files — no implementation code
+- Each test must have a descriptive name that states the intent
+  (e.g. \"should return only NG122 recommendations when filtered to lung cancer guideline\")
+- Each test must assert a specific expected behaviour
+- Tests WILL fail — they test unimplemented code. That is correct.
+- Do not introduce new testing patterns, unless the existing patterns
+  cannot express the requirement. If you must deviate, add a comment
+  explaining why.
+- Match the test structure, assertion style, and file organization
+  of existing tests in the project
+
+For each layer in ${TDD_LAYERS}:
+  unit — test individual functions/modules in isolation
+  integration — test cross-module interactions (adapters, service composition)
+  component — test React component behaviour (render + interact)
+  e2e — test user workflows via Playwright (1-2 tests max, golden path only)
+
+After writing all tests, output a JSON intent map.
+Output ONLY valid JSON (no markdown fences, no commentary):
+{
+  \"intent_map\": [
+    {
+      \"test_file\": \"relative/path/to/test.ts\",
+      \"layer\": \"unit|integration|component|e2e\",
+      \"deliverable\": \"D1|D2|...\",
+      \"intents\": [
+        {
+          \"test_name\": \"descriptive test name\",
+          \"expected_behaviour\": \"1 sentence of what this test verifies\",
+          \"assertion_type\": \"equality|contains|throws|renders|navigates\",
+          \"key_assertion\": \"the core expect() or assertion line\"
+        }
+      ]
+    }
+  ]
+}"
+
+  # Parse the intent map from Claude's response
+  local parsed=""
+  if parsed=$(_extract_json_from_response); then
+    if [ -n "$parsed" ]; then
+      _jq_update --argjson m "$parsed" '.semantic.intent_map = ($m.intent_map // $m)'
+      _ensure_explain_dir
+      echo "$parsed" > "$EXPLAIN_DIR/intent_map.json"
+      log OK "Intent map saved to state and $EXPLAIN_DIR/intent_map.json"
+    else
+      log WARN "Could not parse intent map — tests were written but no structured map available"
+    fi
+  else
+    log WARN "Could not parse intent map — tests were written but no structured map available"
+  fi
+
+  # ── Red-phase verification: confirm new tests fail (expected before implementation) ──
+  log INFO "Red-phase verification: confirming new tests fail..."
+  local red_exit=0
+  _run_all_suites || red_exit=$?
+
+  if [ $red_exit -eq 0 ]; then
+    log WARN "All tests pass before implementation. Either the feature already exists or tests are vacuous. Review intent_map."
+    _jq_update --arg s "warning_all_pass" '.deterministic.tdd_status = $s'
+  else
+    # Check for syntax/compilation errors vs expected test failures
+    if echo "$LAST_TEST_OUTPUT" | grep -qiE 'SyntaxError|ParseError|cannot find module|compilation failed'; then
+      log WARN "Tests have syntax/parse errors — sending to Claude for one fix attempt"
+      local syntax_output
+      syntax_output=$(echo "$LAST_TEST_OUTPUT" | tail -n 200)
+      run_claude "The test files you just wrote have syntax or compilation errors. Fix them.
+Do NOT write implementation code — only fix the test file errors.
+
+Errors:
+\`\`\`
+${syntax_output}
+\`\`\`"
+      _jq_update --arg s "red_fixed_syntax" '.deterministic.tdd_status = $s'
+    else
+      log OK "Red-phase verified: new tests fail as expected"
+      _jq_update --arg s "red_verified" '.deterministic.tdd_status = $s'
+    fi
+  fi
+}
+
+phase_pattern_baseline() {
+  if [ "${PATTERN_CONFORMANCE}" != "true" ]; then
+    log INFO "Pattern conformance disabled — skipping pattern_baseline phase"
+    return 0
+  fi
+
+  run_claude "Before implementing, catalogue the coding patterns in the areas you're about to change.
+Read the files that are adjacent to or imported by the files listed in your plan.
+
+For each pattern you observe, note:
+- What area it governs (error handling, state management, test structure, etc.)
+- Which files demonstrate it
+- How strong it is: \"universal\" (every instance), \"strong\" (most instances),
+  \"weak\" (a few instances), \"single\" (one instance — barely a pattern)
+
+Also scan for existing PATTERN-DEVIATION comments — these are prior decisions
+to intentionally deviate. Note them so you don't re-litigate them during implementation.
+
+Output ONLY valid JSON (no markdown fences, no commentary):
+{
+  \"patterns\": [
+    {
+      \"id\": \"P001\",
+      \"area\": \"description of what this pattern governs\",
+      \"files_observed\": [\"file1.ts\", \"file2.ts\"],
+      \"pattern\": \"description of the pattern\",
+      \"strength\": \"universal|strong|weak|single\",
+      \"occurrences\": 3
+    }
+  ],
+  \"existing_deviations\": [
+    {
+      \"file\": \"path/to/file.ts\",
+      \"line\": 42,
+      \"comment\": \"the PATTERN-DEVIATION comment text\",
+      \"pattern_area\": \"what pattern it deviates from\"
+    }
+  ]
+}"
+
+  local parsed=""
+  if parsed=$(_extract_json_from_response); then
+    if [ -n "$parsed" ]; then
+      _jq_update --argjson p "$parsed" '.semantic.pattern_baseline = $p'
+      _ensure_explain_dir
+      echo "$parsed" > "$EXPLAIN_DIR/pattern_baseline.json"
+      log OK "Pattern baseline saved to state and $EXPLAIN_DIR/pattern_baseline.json"
+    else
+      log WARN "Could not parse pattern baseline — conformance review will skip"
+    fi
+  else
+    log WARN "Could not parse pattern baseline — conformance review will skip"
+  fi
+}
+
 phase_implement() {
-  run_claude "Execute the implementation plan you created in the previous step.
+  local ownership_context=""
+  ownership_context=$(_build_ownership_context)
+
+  # If TDD is enabled and we have an intent map, use the TDD-aware prompt
+  local intent_map=""
+  intent_map=$(_state_get '.semantic.intent_map // empty')
+
+  if [ "${TDD_ENABLED}" = "true" ] && [ -n "$intent_map" ] && [ "$intent_map" != "null" ]; then
+    local formatted_intents
+    formatted_intents=$(echo "$intent_map" | jq -r '
+      [ .[] |
+        "## " + .test_file + " (" + .layer + ")\n" +
+        ([ .intents[]? |
+          "- " + .test_name + ": " + .expected_behaviour
+        ] | join("\n"))
+      ] | join("\n\n")
+    ' 2>/dev/null) || formatted_intents=""
+
+    run_claude "${ownership_context:+${ownership_context}
+
+}Tests have been written that encode the acceptance criteria. Your job is to
+make them pass.
+
+INTENT MAP (what the tests expect):
+${formatted_intents}
+
+Implement all changes now. Make every failing test pass.
+Do NOT modify the test expectations — if a test seems wrong relative
+to the spec, flag it as a comment but implement to the spec.
+Commit nothing — just write the code."
+  else
+    # Original prompt — used when TDD_ENABLED=false or no intent map
+    run_claude "${ownership_context:+${ownership_context}
+
+}Execute the implementation plan you created in the previous step.
 Implement all changes now. Follow the plan exactly.
 Write tests alongside implementation.
 Commit nothing — just write the code."
+  fi
 
   log OK "Implementation complete"
 }
@@ -3025,6 +3301,13 @@ Review all code in the changed files for:
 ${test_audit_prompt}
 ${REVIEW_EXTRAS:+${REVIEW_EXTRAS}
 }Fix any issues you find."
+
+  # Pattern conformance — continues the skill_chain conversation
+  if [ "${PATTERN_CONFORMANCE}" = "true" ]; then
+    log INFO "Running pattern conformance..."
+    _run_pattern_conformance
+    _extract_conformance_findings
+  fi
 
   # Security check — continues the skill_chain conversation
   log INFO "Running security check..."
@@ -3692,6 +3975,8 @@ main() {
     fi
     _init_state
   fi
+
+  _load_ownership_manifest
 
   # Apply --skip flags: mark requested phases as completed so the loop skips them
   if [ -n "$_CLI_SKIP_PHASES" ]; then

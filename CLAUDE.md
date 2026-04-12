@@ -4,7 +4,7 @@
 
 Two bash scripts that form a reusable autonomous pipeline engine:
 
-- `bin/auto_claude` (~3000 lines) — single-project pipeline: plan → decisions → implement → test_fix → ci_checks → impact → skill_chain → loc_enforcement → fresh_review → doc_update → final
+- `bin/auto_claude` (~4000 lines) — single-project pipeline: plan → decisions → test_intent → pattern_baseline → implement → test_fix → ci_checks → impact → skill_chain → loc_enforcement → fresh_review → doc_update → final
 - `bin/worktree_auto_claude` (~1300 lines) — parallel orchestrator: forks git worktrees, runs independent auto_claude instances, cherry-picks results back
 
 Project-specific configuration lives in `.auto_claude.conf` files (see `conf/` for examples).
@@ -25,7 +25,9 @@ tests/
 ├── test_auto_claude_state.sh     # State file, context packs, test results
 ├── test_auto_claude_pipeline.sh  # Suite discovery, _run_all_suites, changed files
 ├── test_auto_claude_ci_checks.sh # CI check discovery, auto-fix, Claude-fix
-└── test_auto_claude_phase_final.sh # Final phase, auto-commit logic
+├── test_auto_claude_phase_final.sh # Final phase, auto-commit logic
+├── test_auto_claude_escalation.sh  # Escalation strategy and boundary violations
+└── test_auto_claude_ownership.sh   # Ownership manifest loading and context building
 docs/
 ├── auto_claude.md                    # Pipeline architecture documentation
 └── auto-claude-explainability-sketch.md # Explainability design notes

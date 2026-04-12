@@ -19,17 +19,21 @@ The spec is a markdown file following the format defined in `CLAUDE.md`. It desc
 The pipeline splits into two blocks at a configurable **seam** (`SEAM_AFTER`, default: `ci_checks`).
 
 ```
-Authoring block          Quality block
-─────────────────────    ──────────────────────────────────────────
-plan                     skill_chain
-  ↓                        ↓
-implement                loc_enforcement
-  ↓                        ↓
-test_fix                 fresh_review
-  ↓                        ↓
-ci_checks  ── seam ──▶  doc_update
-                           ↓
-                         final
+Authoring block              Quality block
+───────────────────────      ──────────────────────────────────────────
+plan                         impact
+  ↓                            ↓
+decisions                    skill_chain (incl. pattern conformance)
+  ↓                            ↓
+test_intent  [TDD_ENABLED]   loc_enforcement
+  ↓                            ↓
+pattern_baseline [PATTERN_CONFORMANCE]  fresh_review
+  ↓                            ↓
+implement                    doc_update
+  ↓                            ↓
+test_fix                     final
+  ↓
+ci_checks  ── seam ──▶
 ```
 
 ### Authoring block
@@ -54,10 +58,19 @@ The engine never hard-codes test commands or CI tools — it discovers what's av
 ## Phases
 
 ### `plan`
-Reads the spec and produces a numbered implementation checklist. Uses `PLAN_CONTEXT` for project-specific framing. In opinionated mode, architectural standards are prepended here.
+Reads the spec and produces a numbered implementation checklist. Uses `PLAN_CONTEXT` for project-specific framing. In opinionated mode, architectural standards are prepended here. When an ownership manifest is present (worktree mode), ownership context is injected to constrain planning to owned boundaries.
+
+### `decisions`
+Writes an explainability manifest to `.auto_claude_explain/decisions.json` capturing key decisions made during planning — what was chosen, what alternatives were considered, and why. Controlled by `EXPLAIN_PHASES` (default: true). Skipped when explainability is disabled.
+
+### `test_intent`
+TDD test-first phase. Controlled by `TDD_ENABLED` (default: true). Reads the spec and plan, then asks Claude to write test stubs and skeleton assertions that express the spec's requirements — before any implementation exists. Verifies that a test run produces red (failing) results, confirming the tests are meaningful. The intent map is stored in state at `.semantic.test_intent_map` for use by `phase_implement`.
+
+### `pattern_baseline`
+Catalogues existing coding patterns in the areas about to be changed. Controlled by `PATTERN_CONFORMANCE` (default: true). Claude reads files adjacent to the planned changes and records naming conventions, error handling patterns, import styles, and structural patterns. The baseline is stored in state at `.semantic.pattern_baseline` and used later by `skill_chain` for conformance checking.
 
 ### `implement`
-Executes the plan. Writes code and tests. No commits.
+Executes the plan. Writes code and tests. No commits. When `TDD_ENABLED` is true and a test intent map exists in state, implementation is guided by the intent map — Claude is instructed to make the red tests pass rather than writing tests from scratch.
 
 ### `test_fix`
 Runs all `test_suite_*()` functions. On failure, sends output to Claude for fixes. Loops up to `MAX_TEST_ITERATIONS` (default: 5).
@@ -70,7 +83,7 @@ Runs all `ci_check_*()` functions. Two-track fix strategy:
 After any fixes, re-runs tests to confirm nothing regressed. Loops up to `MAX_CI_ITERATIONS` (default: 3).
 
 ### `skill_chain`
-Fresh session. Three sequential passes on the changed files: code review → security audit → simplification. Uses `REVIEW_EXTRAS` and `SECURITY_EXTRAS` for project-specific criteria. Extracts structured findings into state on completion.
+Fresh session. Sequential passes on the changed files: code review → pattern conformance (if `PATTERN_CONFORMANCE` is true) → security audit → simplification. Pattern conformance compares the implementation against the baseline captured in `phase_pattern_baseline`, reverting unjustified deviations and documenting intentional ones. Uses `REVIEW_EXTRAS` and `SECURITY_EXTRAS` for project-specific criteria. Extracts structured findings (including `pattern_conformance` with `deviations_reverted` and `deviations_kept`) into state on completion.
 
 ### `loc_enforcement`
 Fresh session. Finds files exceeding `MAX_LOC` (default: 300) that were changed during this pipeline run. Asks Claude to split them. Stale-detection prevents infinite loops when a file genuinely cannot be split further.
@@ -109,6 +122,8 @@ MAX_REFACTOR_ROUNDS=10      # How many LOC refactor rounds before giving up
 MAX_LOC=300                 # Line count threshold for loc_enforcement
 SEAM_AFTER="ci_checks"      # Last phase of the authoring block
 OPINIONATED=false           # See Opinionated Mode below
+TDD_ENABLED=true            # Enable test_intent phase and TDD-aware implement
+PATTERN_CONFORMANCE=true    # Enable pattern_baseline phase and conformance in skill_chain
 ```
 
 ### Optional — prompt fragments
@@ -202,6 +217,8 @@ Resume after a crash — the pipeline detects an interrupted run on next invocat
 | `.auto_claude_<timestamp>.log` | Full timestamped log of every phase |
 | `.auto_claude_baseline` | Snapshot of untracked files at pipeline start (deleted on completion) |
 | `.auto_claude.lock/` | Concurrency guard — prevents two instances running on the same project |
+| `.auto_claude_ownership.json` | Boundary manifest — written by `worktree_auto_claude`, read by `_load_ownership_manifest` to constrain each instance to its owned files |
+| `.auto_claude_explain/` | Explainability artifacts — `decisions.json`, `assumptions.json`, `coverage_map.json`, `impact_assessment.md` |
 
 ---
 
@@ -223,6 +240,8 @@ The test suite mirrors the structure of the pipeline — one test file per funct
 |------|--------|
 | `test_auto_claude_ci_checks.sh` | CI check discovery, classification, auto-discovery from `package.json` |
 | `test_auto_claude_phase_final.sh` | Git staging loop — `git check-ignore` exit code handling, artifact filtering |
+| `test_auto_claude_escalation.sh` | Escalation strategy and boundary violation handling |
+| `test_auto_claude_ownership.sh` | Ownership manifest loading and context building |
 
 Run all tests:
 ```bash

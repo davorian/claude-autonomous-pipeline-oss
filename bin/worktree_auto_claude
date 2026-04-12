@@ -20,6 +20,7 @@ STARTUP_TIMEOUT=60     # seconds to wait for auto_claude lock file
 SETUP_TIMEOUT=600      # seconds for setup_worktree hook (e.g. yarn install)
 PHASE_STALL_TIMEOUT=1800  # seconds with no phase change before marking run as stalled (30 min)
 POLL_GLOBAL_TIMEOUT=7200  # seconds before the entire poll loop gives up (2 hours)
+BOUNDARY_RECONCILE=false  # set true to auto-resolve TODO(boundary) comments after merge
 
 # ─── Globals ─────────────────────────────────────────────────────────────────
 PROJECT_ROOT=""
@@ -460,6 +461,11 @@ write_worktree_conf() {
   local conf_fn="conf_body_${name}"
 
   "$conf_fn" > "${wt_path}/.auto_claude.conf"
+
+  # Ownership context is handled by auto_claude's _load_ownership_manifest at runtime.
+  # The manifest is copied to the worktree by run_parallel_group, so auto_claude
+  # picks it up via _build_ownership_context in phase_plan and phase_implement.
+
   log OK "Wrote .auto_claude.conf for ${name}"
 }
 
@@ -515,7 +521,7 @@ launch_terminal() {
   osascript <<EOF
 tell application "Terminal"
   activate
-  do script "cd '${wt_path}' && echo '══ worktree_auto_claude: ${name} ══' && auto_claude '${spec}'; echo ''; echo '══ ${name} finished (exit \$?) ══'"
+  do script "cd '${wt_path}' && export AUTO_CLAUDE_RUN_NAME='${name}' && echo '══ worktree_auto_claude: ${name} ══' && auto_claude '${spec}'; echo ''; echo '══ ${name} finished (exit \$?) ══'"
 end tell
 EOF
 
@@ -776,6 +782,166 @@ run_sequential_step() {
   fi
 }
 
+# ─── Ownership Manifest ─────────────────────────────────────────────────────
+
+# Generate an ownership manifest that maps each parallel run to the files it owns,
+# may read, and must not touch. Called once before worktrees fork.
+_generate_ownership_manifest() {
+  local -a run_names=("$@")
+
+  log INFO "Generating ownership manifest for ${#run_names[@]} parallel runs..."
+
+  # Collect spec file (use the first run's spec as reference)
+  local spec_file=""
+  for name in "${run_names[@]}"; do
+    spec_file="${_RUN_SPECS[$name]}"
+    [ -n "$spec_file" ] && break
+  done
+
+  local spec_content=""
+  if [ -n "$spec_file" ] && [ -f "$spec_file" ]; then
+    spec_content="$(cat "$spec_file")"
+  fi
+
+  # Collect file tree
+  local file_tree
+  file_tree=$(find "$PROJECT_ROOT" \( -name '*.ts' -o -name '*.tsx' -o -name '*.py' -o -name '*.ex' -o -name '*.exs' -o -name '*.go' -o -name '*.rs' \) -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/deps/*' -not -path '*/_build/*' 2>/dev/null | head -500)
+
+  # Collect each run's PLAN_CONTEXT
+  local run_contexts=""
+  for name in "${run_names[@]}"; do
+    local conf_fn="conf_body_${name}"
+    local plan_ctx=""
+    # Extract PLAN_CONTEXT from the conf body by writing to temp and grepping
+    local tmp_conf
+    tmp_conf=$(mktemp)
+    "$conf_fn" > "$tmp_conf" 2>/dev/null || true
+    plan_ctx=$(grep -A 50 'PLAN_CONTEXT=' "$tmp_conf" | head -50) || true
+    rm -f "$tmp_conf"
+    run_contexts="${run_contexts}
+Run: ${name}
+Context: ${plan_ctx}
+---"
+  done
+
+  # Call Claude for manifest generation
+  local prompt="You are generating a file ownership manifest for parallel auto_claude runs.
+
+SPEC:
+${spec_content}
+
+PARALLEL RUNS:
+${run_contexts}
+
+PROJECT FILE TREE (sample):
+${file_tree}
+
+For each parallel run, assign files to one of three categories:
+- owns: files this run will create or make structural changes to (read-write)
+- reads: files this run needs to read but must not modify
+- must_not_touch: files owned by OTHER runs that this run must not touch
+
+Rules:
+- Files not listed in any run's owns are implicitly shared.
+- If a file appears in multiple runs' deliverables, assign it to the run that makes the most structural changes and mark it reads for the others.
+- New files created by a run belong to that run's owns list.
+
+Output ONLY valid JSON (no markdown fences, no commentary):
+{
+  \"runs\": {
+    \"<run_name>\": {
+      \"owns\": [\"path/to/file.ts\"],
+      \"reads\": [\"path/to/other.ts\"],
+      \"must_not_touch\": [\"path/to/fenced.ts\"]
+    }
+  }
+}"
+
+  local raw_output exit_code=0
+  raw_output=$(claude -p "$prompt" --dangerously-skip-permissions --output-format json 2>&1) || exit_code=$?
+
+  if [ $exit_code -ne 0 ]; then
+    log WARN "Ownership manifest generation failed (exit ${exit_code}) — continuing without enforcement"
+    return 0
+  fi
+
+  # Parse response
+  local response_text
+  response_text=$(echo "$raw_output" | jq -r '.result // empty' 2>/dev/null) || true
+  [ -z "$response_text" ] && response_text="$raw_output"
+
+  local parsed=""
+  # Tier 1: direct parse
+  if parsed=$(echo "$response_text" | jq '.' 2>/dev/null) && [ -n "$parsed" ]; then
+    echo "$parsed" > "${PROJECT_ROOT}/.auto_claude_ownership.json"
+    log OK "Ownership manifest generated: ${PROJECT_ROOT}/.auto_claude_ownership.json"
+    return 0
+  fi
+
+  # Tier 2: markdown fence
+  local extracted
+  extracted=$(echo "$response_text" | sed -n '/^```\(json\)\{0,1\}$/,/^```$/p' | sed '1d;$d')
+  if [ -n "$extracted" ] && parsed=$(echo "$extracted" | jq '.' 2>/dev/null); then
+    echo "$parsed" > "${PROJECT_ROOT}/.auto_claude_ownership.json"
+    log OK "Ownership manifest generated (from markdown fence): ${PROJECT_ROOT}/.auto_claude_ownership.json"
+    return 0
+  fi
+
+  # Tier 3: brace extraction
+  local brace_content
+  brace_content=$(echo "$response_text" | sed -n '/{/,/^}/p')
+  if [ -n "$brace_content" ] && parsed=$(echo "$brace_content" | jq '.' 2>/dev/null); then
+    echo "$parsed" > "${PROJECT_ROOT}/.auto_claude_ownership.json"
+    log OK "Ownership manifest generated (from brace extraction): ${PROJECT_ROOT}/.auto_claude_ownership.json"
+    return 0
+  fi
+
+  log WARN "Could not parse ownership manifest — continuing without enforcement"
+}
+
+# Write a git pre-commit hook into a worktree that rejects changes to fenced files.
+_write_boundary_fence() {
+  local name="$1"
+  local wt_path="${_WT_PATHS[$name]}"
+  local manifest="${wt_path}/.auto_claude_ownership.json"
+
+  if [ ! -f "$manifest" ]; then
+    return 0
+  fi
+
+  # Read must_not_touch list for this run
+  local fence_files
+  fence_files=$(jq -r --arg name "$name" '(.runs[$name].must_not_touch // [])[]' "$manifest" 2>/dev/null) || true
+
+  if [ -z "$fence_files" ]; then
+    log INFO "No fenced files for ${name} — skipping boundary fence"
+    return 0
+  fi
+
+  local hook_dir="${wt_path}/.git/hooks"
+  mkdir -p "$hook_dir"
+  # Ensure git uses local hooks dir (some git versions require this)
+  git -C "$wt_path" config core.hooksPath .git/hooks 2>/dev/null || true
+
+  cat > "${hook_dir}/pre-commit" <<HOOKEOF
+#!/bin/bash
+# Boundary fence — auto-generated by worktree_auto_claude
+# Rejects changes to files owned by other parallel runs.
+staged=\$(git diff --cached --name-only)
+for file in \$staged; do
+  case "\$file" in
+$(echo "$fence_files" | while read -r f; do [ -n "$f" ] && echo "    ${f}) echo \"BOUNDARY FENCE: Cannot modify \${file} — owned by another parallel run.\"; echo \"Add a // TODO(boundary): comment describing the interface you need.\"; exit 1 ;;"; done)
+  esac
+done
+exit 0
+HOOKEOF
+
+  chmod +x "${hook_dir}/pre-commit"
+  local count
+  count=$(echo "$fence_files" | grep -c . 2>/dev/null || echo 0)
+  log OK "Boundary fence installed for ${name}: ${count} fenced files"
+}
+
 run_parallel_group() {
   local -a names=("$@")
 
@@ -845,6 +1011,27 @@ run_parallel_group() {
     fi
   done
 
+  # Phase 1.5: Generate ownership manifest and install boundary fences
+  if [ ${#needs_run[@]} -gt 1 ]; then
+    # Only generate manifest when there are multiple parallel runs
+    local -a manifest_names=()
+    for name in "${needs_run[@]}"; do
+      [ "${_WT_STATUS[$name]}" = "launch_failed" ] && continue
+      manifest_names+=("$name")
+    done
+    if [ ${#manifest_names[@]} -gt 1 ]; then
+      _generate_ownership_manifest "${manifest_names[@]}"
+      # Copy manifest and install fences in each worktree
+      if [ -f "${PROJECT_ROOT}/.auto_claude_ownership.json" ]; then
+        for name in "${manifest_names[@]}"; do
+          local wt_path="${_WT_PATHS[$name]}"
+          cp "${PROJECT_ROOT}/.auto_claude_ownership.json" "${wt_path}/" 2>/dev/null || true
+          _write_boundary_fence "$name"
+        done
+      fi
+    fi
+  fi
+
   # Phase 2: Run setup hook in each worktree (e.g. yarn install)
   for name in "${needs_run[@]}"; do
     [ "${_WT_STATUS[$name]}" = "launch_failed" ] && continue
@@ -909,6 +1096,31 @@ run_parallel_group() {
       cherry_pick_commits "$name" || any_cherry_pick_failed=true
     fi
   done
+
+  # Phase 5.5: Post-merge reconciliation — detect TODO(boundary) comments
+  log INFO "═══ Boundary reconciliation ═══"
+  local boundary_todos
+  boundary_todos=$(grep -rn 'TODO(boundary):' "$PROJECT_ROOT" --include='*.ts' --include='*.tsx' --include='*.py' --include='*.ex' --include='*.exs' --include='*.go' --include='*.rs' 2>/dev/null) || true
+  if [ -n "$boundary_todos" ]; then
+    log WARN "Found TODO(boundary) comments requiring resolution:"
+    echo "$boundary_todos" | while IFS= read -r line; do
+      log WARN "  ${line}"
+    done
+    if [ "${BOUNDARY_RECONCILE}" = "true" ]; then
+      log INFO "BOUNDARY_RECONCILE=true — running Claude to resolve boundary TODOs..."
+      local reconcile_prompt="The following TODO(boundary) comments were left by parallel auto_claude runs.
+Each one describes an interface change needed in a file owned by another run.
+Read each TODO, implement the requested interface change in the target file,
+and remove the TODO comment.
+
+TODOs:
+${boundary_todos}"
+      claude -p "$reconcile_prompt" --dangerously-skip-permissions 2>&1 | tail -20 || \
+        log WARN "Boundary reconciliation failed — resolve TODOs manually"
+    fi
+  else
+    log OK "No TODO(boundary) comments found — boundaries were clean"
+  fi
 
   # Phase 6: Cleanup — only for fully merged worktrees
   log INFO "═══ Cleanup ═══"
