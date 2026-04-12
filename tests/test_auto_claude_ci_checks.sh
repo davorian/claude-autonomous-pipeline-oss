@@ -9,7 +9,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AUTO_CLAUDE="$SCRIPT_DIR/auto_claude"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AUTO_CLAUDE="$REPO_ROOT/bin/auto_claude"
+[ -f "$AUTO_CLAUDE" ] || AUTO_CLAUDE="$HOME/bin/auto_claude"
 PASS=0
 FAIL=0
 TEST_TMPDIR=""

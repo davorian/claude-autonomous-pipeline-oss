@@ -55,8 +55,9 @@ _source_state_functions() {
   eval "$(awk '/_build_context_pack\(\)/,/^\}$/' "$ac")"
 }
 
-AC="$HOME/bin/auto_claude"
-[ -f "$AC" ] || AC="$(dirname "$0")/auto_claude"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+AC="$(cd "$SCRIPT_DIR/.." && pwd)/bin/auto_claude"
+[ -f "$AC" ] || AC="$HOME/bin/auto_claude"
 
 # ─── Tests ────────────────────────────────────────────────────────────────────
 
@@ -145,6 +146,7 @@ test_4_context_pack_fresh_review_excludes_intent() {
   PROJECT_ROOT="$TEST_TMPDIR"
   PROJECT_NAME="test"
   BASELINE_COMMIT=""
+  EXPLAIN_DIR="$TEST_TMPDIR/explain"
   _init_state
 
   # Write a state with plan_intent populated

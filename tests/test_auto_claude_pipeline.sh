@@ -39,13 +39,23 @@ _assert_not_contains() {
   echo "$haystack" | grep -q "$needle" && _fail "$label" "'$needle' unexpectedly found" || _pass "$label"
 }
 
-AC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/auto_claude"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AC="$(cd "$SCRIPT_DIR/.." && pwd)/bin/auto_claude"
 [ -f "$AC" ] || AC="$HOME/bin/auto_claude"
 
 _source_pipeline_functions() {
   log() { :; }
 
+  # Stub variables that _run_all_suites depends on
+  CONF_FILE="${CONF_FILE:-/dev/null}"
+  _ENV_SKIP_SUITES="${_ENV_SKIP_SUITES:-}"
+  _SUITE_TMP_DIR=""
+  SUITE_IDLE_TIMEOUT="${SUITE_IDLE_TIMEOUT:-0}"
+
   eval "$(awk '/^_discover_test_suites[(]/{found=1} found{print} /^[}]$/{if(found){found=0}}' "$AC")"
+  eval "$(awk '/^_suite_tmp_dir[(]/{found=1} found{print} /^[}]$/{if(found){found=0}}' "$AC")"
+  eval "$(awk '/^_get_suite_exit[(]/{found=1} found{print} /^[}]$/{if(found){found=0}}' "$AC")"
+  eval "$(awk '/^_get_suite_output[(]/{found=1} found{print} /^[}]$/{if(found){found=0}}' "$AC")"
   eval "$(awk '/^_run_all_suites[(]/{found=1} found{print} /^[}]$/{if(found){found=0}}' "$AC")"
   eval "$(awk '/^_filter_to_changed[(]/{found=1} found{print} /^[}]$/{if(found){found=0}}' "$AC")"
   eval "$(awk '/^_default_find_long_files[(]/{found=1} found{print} /^[}]$/{if(found){found=0}}' "$AC")"
