@@ -53,7 +53,7 @@ MAX_REFACTOR_ROUNDS=10
 MAX_LOC=300
 MAX_CI_ITERATIONS=3
 SUITE_IDLE_TIMEOUT=120  # seconds of no new output before killing a suite; 0 = no timeout
-PHASES=(plan implement test_fix ci_checks skill_chain loc_enforcement fresh_review doc_update final)
+PHASES=(plan decisions implement test_fix ci_checks impact skill_chain loc_enforcement fresh_review doc_update final)
 
 # The last phase in the authoring block. Extraction happens after this phase
 # and all subsequent phases get fresh sessions with structured context packs.
@@ -67,6 +67,18 @@ SECURITY_EXTRAS=""
 FRESH_REVIEW_PREAMBLE=""
 FRESH_REVIEW_EXTRAS=""
 DOC_UPDATE_CONTEXT=""
+
+# File glob patterns — overridable in .auto_claude.conf.
+# TEST_FILE_GLOBS: patterns for test files (used by test audit to detect test changes).
+# SOURCE_FILE_GLOBS: patterns for source files (used by LOC enforcement to find long files).
+TEST_FILE_GLOBS=("*.test.ts" "*.test.tsx" "*.spec.ts" "*.spec.tsx" "*.test.js" "*.spec.js" "*.test.ex" "*.test.exs" "*_test.go" "*_test.rb" "test_*.py" "*_test.py")
+SOURCE_FILE_GLOBS=("*.ts" "*.tsx" "*.js" "*.jsx" "*.py" "*.go" "*.rs" "*.rb" "*.ex" "*.exs" "*.kt" "*.swift")
+
+# Explainability phase configuration — all overridable in .auto_claude.conf
+EXPLAIN_PHASES=true           # Master switch — set false to disable all explainability
+DECISIONS_REVIEW=false        # Pause after decisions manifest for human review
+COVERAGE_GATE=false           # Pause if high-severity coverage gaps found
+ARTIFACTS_DIR=""              # Override auto-detection of recovery artifacts. Empty = auto-detect.
 
 # Opinionated mode — injects architectural standards into phase prompts.
 # Settable in .auto_claude.conf or overridden per-run via --opinionated CLI flag.
@@ -130,6 +142,8 @@ LOG_FILE="${PROJECT_ROOT}/.auto_claude_$(date +%Y%m%d_%H%M%S).log"
 STATE_FILE="${PROJECT_ROOT}/.auto_claude_state.json"
 BASELINE_FILE="${PROJECT_ROOT}/.auto_claude_baseline"
 LOCK_FILE="${PROJECT_ROOT}/.auto_claude.lock"
+EXPLAIN_DIR="${PROJECT_ROOT}/.auto_claude_explain"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ─── Concurrency Guard ─────────────────────────────────────────────────────
 # Only one auto_claude instance may run per project. A second instance on the
@@ -206,6 +220,181 @@ log() {
   esac
 
   printf "[%s %s] %s\n" "$timestamp" "$level" "$msg" >> "$LOG_FILE"
+}
+
+# ─── Artifact Detection & Access ─────────────────────────────────────────────
+# Recovery artifacts enrich explainability but are never required.
+# ARTIFACTS_DIR can be set in .auto_claude.conf to override auto-detection.
+
+HAS_ARTIFACTS=false  # set by _detect_artifacts at startup
+
+_detect_artifacts() {
+  if [ "${EXPLAIN_PHASES:-true}" != "true" ]; then
+    HAS_ARTIFACTS=false
+    ARTIFACTS_DIR=""
+    log INFO "Explainability phases disabled (EXPLAIN_PHASES=false)"
+    return
+  fi
+
+  # Explicit config takes precedence
+  if [ -n "${ARTIFACTS_DIR:-}" ] && [ -d "$ARTIFACTS_DIR" ]; then
+    HAS_ARTIFACTS=true
+    log INFO "Artifacts directory: $ARTIFACTS_DIR"
+    return
+  fi
+
+  # Auto-detect: check project root, then parent directory (monorepo layout)
+  for candidate in \
+    "$PROJECT_ROOT/.recovery_artifacts" \
+    "$(dirname "$PROJECT_ROOT")/.recovery_artifacts"; do
+    if [ -d "$candidate" ] && [ -f "$candidate/system_graph.json" ]; then
+      ARTIFACTS_DIR="$candidate"
+      HAS_ARTIFACTS=true
+      log INFO "Auto-detected artifacts: $ARTIFACTS_DIR"
+      return
+    fi
+  done
+
+  HAS_ARTIFACTS=false
+  ARTIFACTS_DIR=""
+  log INFO "No recovery artifacts found — explainability phases will use LLM-only mode"
+}
+
+_read_artifact() {
+  local name="$1"
+  local file="$ARTIFACTS_DIR/${name}.json"
+
+  if [ ! -f "$file" ]; then
+    log DEBUG "Artifact not found: $name (skipping)"
+    echo ""
+    return
+  fi
+
+  if ! jq '.' "$file" >/dev/null 2>&1; then
+    log WARN "Artifact malformed: $name (skipping)"
+    echo ""
+    return
+  fi
+
+  cat "$file"
+}
+
+_ensure_explain_dir() {
+  mkdir -p "$EXPLAIN_DIR"
+}
+
+# Parse JSON from LAST_RESPONSE_TEXT. Tries raw parse first, then markdown fence extraction.
+# Echoes the parsed JSON on success, empty string on failure.
+_extract_json_from_response() {
+  local parsed=""
+  if parsed=$(echo "$LAST_RESPONSE_TEXT" | jq '.' 2>/dev/null); then
+    echo "$parsed"
+    return 0
+  fi
+
+  local extracted
+  extracted=$(echo "$LAST_RESPONSE_TEXT" | sed -n '/^```\(json\)\{0,1\}$/,/^```$/p' | sed '1d;$d')
+  if [ -n "$extracted" ] && parsed=$(echo "$extracted" | jq '.' 2>/dev/null); then
+    echo "$parsed"
+    return 0
+  fi
+
+  echo ""
+  return 1
+}
+
+_filter_artifacts_for_spec() {
+  [ "$HAS_ARTIFACTS" != true ] && return
+
+  # Extract entity/table names from spec and plan (deterministic regex)
+  local spec_entities=""
+  if [ -f "$SPEC_FILE" ]; then
+    spec_entities=$(grep -oiE '\b[a-z][a-z_]*[a-z]\b' "$SPEC_FILE" \
+      | grep -iE '(table|view|_candidates|_cohorts|_programmes|_users|_companies|_qualifications|_apprentice|_employers|_goals|_sessions|_events)' \
+      | sort -u || true)
+  fi
+
+  # Also include table names from FROM/JOIN/INTO clauses in plan output
+  if [ -f "$SPEC_FILE" ]; then
+    local sql_entities
+    sql_entities=$(grep -oiE '(FROM|JOIN|INTO|UPDATE)\s+"?([a-z][a-z_]*)"?' "$SPEC_FILE" \
+      | grep -oiE '[a-z][a-z_]+$' | sort -u || true)
+    if [ -n "$sql_entities" ]; then
+      spec_entities=$(printf '%s\n%s' "$spec_entities" "$sql_entities" | sort -u)
+    fi
+  fi
+
+  [ -z "$spec_entities" ] && return
+
+  local output=""
+
+  # Data ownership excerpts for relevant entities
+  local data_ownership
+  data_ownership=$(_read_artifact "data_ownership")
+  if [ -n "$data_ownership" ]; then
+    local filtered
+    filtered=$(echo "$data_ownership" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+names = [n.strip().lower() for n in sys.argv[1].split('\n') if n.strip()]
+matched = [e for e in data.get('entities', []) if e.get('name','').lower() in names]
+if matched: print(json.dumps(matched, indent=2))
+" "$spec_entities" 2>/dev/null || echo "")
+    if [ -n "$filtered" ] && [ "$filtered" != "[]" ]; then
+      output+="### Data Ownership (relevant entities)
+\`\`\`json
+${filtered}
+\`\`\`
+
+"
+    fi
+  fi
+
+  # Invariants for relevant entities
+  local invariants
+  invariants=$(_read_artifact "invariants")
+  if [ -n "$invariants" ]; then
+    local filtered
+    filtered=$(echo "$invariants" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+names = [n.strip().lower() for n in sys.argv[1].split('\n') if n.strip()]
+matched = [i for i in data.get('invariants', []) if any(n in i.get('description','').lower() for n in names)]
+if matched: print(json.dumps(matched[:10], indent=2))
+" "$spec_entities" 2>/dev/null || echo "")
+    if [ -n "$filtered" ] && [ "$filtered" != "[]" ]; then
+      output+="### Invariants (relevant)
+\`\`\`json
+${filtered}
+\`\`\`
+
+"
+    fi
+  fi
+
+  # Event contracts for relevant entities
+  local events
+  events=$(_read_artifact "event_contracts")
+  if [ -n "$events" ]; then
+    local filtered
+    filtered=$(echo "$events" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+names = [n.strip().lower() for n in sys.argv[1].split('\n') if n.strip()]
+matched = [e for e in data.get('events', []) if any(n in e.get('name','').lower() for n in names)]
+if matched: print(json.dumps(matched[:10], indent=2))
+" "$spec_entities" 2>/dev/null || echo "")
+    if [ -n "$filtered" ] && [ "$filtered" != "[]" ]; then
+      output+="### Event Contracts (relevant)
+\`\`\`json
+${filtered}
+\`\`\`
+
+"
+    fi
+  fi
+
+  echo "$output"
 }
 
 # ─── Progress Spinner ────────────────────────────────────────────────────────
@@ -513,6 +702,12 @@ _extract_authoring_summary() {
 
   run_claude "You have completed the planning, implementation, and test-fixing phases. Before moving to code review, summarise your work as structured JSON.
 
+Additionally, list all assumptions your implementation depends on that are NOT verified by the tests you wrote. Focus on:
+- Data model assumptions (table vs view, column semantics, implicit filters)
+- Ordering assumptions (this script runs after X, Y must have happened first)
+- Environment assumptions (config values, feature flags, external service state)
+- Concurrency assumptions (no other process modifies this data concurrently)
+
 Output ONLY valid JSON (no markdown fences, no commentary before or after). Use these exact fields:
 
 {
@@ -521,7 +716,17 @@ Output ONLY valid JSON (no markdown fences, no commentary before or after). Use 
   \"governance_ids\": [\"principle IDs from CONTEXT_INDEX.md that were applied, or empty array\"],
   \"implementation_summary\": \"2-3 sentences describing what was built, key files, and approach\",
   \"key_decisions\": [{\"decision\": \"what was decided\", \"rationale\": \"why\"}],
-  \"test_fix_summary\": \"what broke during testing and how it was fixed, or 'All tests passed on first iteration'\"
+  \"test_fix_summary\": \"what broke during testing and how it was fixed, or 'All tests passed on first iteration'\",
+  \"assumptions_carried_forward\": [
+    {
+      \"id\": \"A001\",
+      \"assumption\": \"description of what is assumed\",
+      \"depends_on\": \"D1-001 or null if no link to decisions manifest\",
+      \"verified_by\": null,
+      \"impact_if_wrong\": \"what breaks if assumption is wrong\",
+      \"suggested_verification\": \"how to check\"
+    }
+  ]
 }"
 
   # Try to parse the response as JSON directly
@@ -530,6 +735,7 @@ Output ONLY valid JSON (no markdown fences, no commentary before or after). Use 
     _jq_update --argjson s "$parsed" \
       '.semantic = (.semantic + $s)'
     log OK "Authoring summary extracted and saved to state"
+    _save_assumptions "$parsed"
     return 0
   fi
 
@@ -540,11 +746,153 @@ Output ONLY valid JSON (no markdown fences, no commentary before or after). Use 
     _jq_update --argjson s "$parsed" \
       '.semantic = (.semantic + $s)'
     log OK "Authoring summary extracted (from markdown fence) and saved to state"
+    _save_assumptions "$parsed"
     return 0
   fi
 
   log WARN "Could not parse extraction response as JSON — semantic state will be empty"
   log WARN "Quality phases will proceed with deterministic context only"
+}
+
+# Extract assumptions to a separate file for cross-deliverable use.
+_save_assumptions() {
+  local parsed="$1"
+  if [ "${EXPLAIN_PHASES:-true}" != "true" ]; then
+    return 0
+  fi
+
+  _ensure_explain_dir
+  local assumptions
+  assumptions=$(echo "$parsed" | jq '.assumptions_carried_forward // []' 2>/dev/null)
+  if [ -n "$assumptions" ] && [ "$assumptions" != "null" ] && [ "$assumptions" != "[]" ]; then
+    echo "$assumptions" > "$EXPLAIN_DIR/assumptions.json"
+    log OK "Assumptions saved to $EXPLAIN_DIR/assumptions.json"
+
+    # Validate against invariants if artifacts available
+    if [ "$HAS_ARTIFACTS" = true ]; then
+      local invariants_data
+      invariants_data=$(_read_artifact "invariants")
+      if [ -n "$invariants_data" ]; then
+        local match_count
+        match_count=$(python3 -c "
+import json, sys
+assumptions = json.loads(sys.argv[1])
+invariants = json.loads(sys.argv[2])
+inv_texts = [i.get('description','').lower() for i in invariants.get('invariants',[])]
+count = 0
+for a in assumptions:
+  words = [w for w in a.get('assumption','').lower().split() if len(w) > 4]
+  for inv in inv_texts:
+    if any(w in inv for w in words):
+      count += 1
+      break
+print(count)
+" "$assumptions" "$invariants_data" 2>/dev/null || echo "0")
+        if [ "$match_count" -gt 0 ]; then
+          log WARN "Assumptions: ${match_count} assumption(s) may relate to known invariants — review $EXPLAIN_DIR/assumptions.json"
+        fi
+      fi
+    fi
+  fi
+}
+
+# Called at the end of phase_test_fix after all tests pass.
+# Maps spec requirements to test coverage, identifies gaps.
+_extract_coverage_map() {
+  if [ "${EXPLAIN_PHASES:-true}" != "true" ]; then
+    return 0
+  fi
+
+  _ensure_explain_dir
+  log INFO "Extracting coverage map..."
+
+  # Build artifact context for failure topology
+  local artifact_prompt=""
+  if [ "$HAS_ARTIFACTS" = true ]; then
+    local failure_topology
+    failure_topology=$(_read_artifact "failure_topology")
+    if [ -n "$failure_topology" ]; then
+      # Trim to relevant failure modes only (first 10 to avoid prompt bloat)
+      local trimmed
+      trimmed=$(echo "$failure_topology" | jq '{failure_modes: .failure_modes[:10]}' 2>/dev/null || echo "")
+      if [ -n "$trimmed" ]; then
+        artifact_prompt+="Known failure modes for the codebase (check if any relate to this change):
+\`\`\`json
+${trimmed}
+\`\`\`
+
+"
+      fi
+    fi
+  fi
+
+  local spec_content=""
+  [ -f "$SPEC_FILE" ] && spec_content=$(cat "$SPEC_FILE")
+
+  run_claude "All tests pass. Now assess test coverage against the spec requirements.
+
+${artifact_prompt}The spec:
+---
+${spec_content}
+---
+
+For each requirement or acceptance criterion in the spec, identify:
+- Whether a test exists that covers it
+- Which test (file:line) covers it
+- Any requirement that has NO test
+
+Also identify scenarios that are implied by the requirements but not explicitly stated — edge cases, interaction effects, error paths that a careful reader would expect to be tested.
+
+Output ONLY valid JSON (no markdown fences, no commentary before or after):
+{
+  \"covered\": [
+    {
+      \"requirement\": \"...\",
+      \"test\": \"file:line\",
+      \"confidence\": \"direct|indirect\"
+    }
+  ],
+  \"uncovered\": [
+    {
+      \"requirement\": \"...\",
+      \"source\": \"where this requirement comes from\",
+      \"severity\": \"high|medium|low\",
+      \"reason\": \"why it is not covered\"
+    }
+  ],
+  \"implicit_scenarios\": [
+    {
+      \"scenario\": \"...\",
+      \"description\": \"...\",
+      \"severity\": \"high|medium|low\"
+    }
+  ]
+}"
+
+  local parsed
+  if parsed=$(_extract_json_from_response); then
+    if [ -n "$parsed" ]; then
+      echo "$parsed" > "$EXPLAIN_DIR/coverage_map.json"
+      _jq_update --argjson c "$parsed" '.semantic.coverage_map = $c'
+      log OK "Coverage map saved to $EXPLAIN_DIR/coverage_map.json"
+
+      # Check for high-severity uncovered items
+      local high_count
+      high_count=$(echo "$parsed" | jq '[.uncovered[]? | select(.severity == "high")] | length' 2>/dev/null || echo "0")
+      if [ "$high_count" -gt 0 ]; then
+        log WARN "Coverage map: ${high_count} high-severity uncovered requirement(s)"
+        if [ "${COVERAGE_GATE:-false}" = "true" ]; then
+          log INFO "COVERAGE_GATE enabled — review gaps at: $EXPLAIN_DIR/coverage_map.json"
+          log INFO "Press Enter to continue, or Ctrl+C to abort..."
+          read -r
+        fi
+      fi
+    else
+      log WARN "Could not parse coverage map — continuing without it"
+    fi
+  else
+    log WARN "Could not parse coverage map — continuing without it"
+  fi
 }
 
 # Called at the authoring/quality seam after _extract_authoring_summary.
@@ -562,7 +910,8 @@ _audit_test_deletions() {
   cd "$PROJECT_ROOT"
 
   local test_diff
-  test_diff=$(git diff "$BASELINE_COMMIT" -- '*.test.ts' '*.test.tsx' '*.spec.ts' '*.spec.tsx' '*.test.js' '*.spec.js' 2>/dev/null || true)
+  # shellcheck disable=SC2086
+  test_diff=$(git diff "$BASELINE_COMMIT" -- ${TEST_FILE_GLOBS[*]} 2>/dev/null || true)
 
   if [ -z "$test_diff" ]; then
     log OK "No test files changed — skipping audit"
@@ -746,7 +1095,15 @@ _build_context_pack() {
           ([ (.deterministic.ci_checks_results.auto_fixed // [])[] ] | if length == 0 then "none" else join(", ") end) +
           ", Claude-fixed: " +
           ([ (.deterministic.ci_checks_results.claude_fixed // [])[] ] | if length == 0 then "none" else join(", ") end) +
-          ")"
+          ")" + "\n\n" +
+        "**Coverage gaps:**\n" +
+          (if (.semantic.coverage_map | type) == "object" then
+            ([ (.semantic.coverage_map.uncovered // [])[] | "- [" + .severity + "] " + .requirement + ": " + .reason ] | if length == 0 then "(none)" else join("\n") end)
+          else "(not captured)" end) + "\n\n" +
+        "**Unverified assumptions:**\n" +
+          (if (.semantic.assumptions_carried_forward | type) == "array" and ((.semantic.assumptions_carried_forward | length) > 0) then
+            ([ (.semantic.assumptions_carried_forward)[] | "- " + .assumption + " (impact if wrong: " + .impact_if_wrong + ")" ] | join("\n"))
+          else "(none)" end)
       ' "$STATE_FILE" 2>/dev/null || echo "## Session Context
 
 (state unavailable — review the changed files directly)"
@@ -767,17 +1124,39 @@ _build_context_pack() {
     fresh_review)
       # NO intent — cold review to avoid anchoring bias.
       # Includes prior quality phases so the reviewer doesn't re-report fixed issues.
-      jq -r '
-        "## Session Context\n\n" +
-        "**Completed quality phases:** " +
-          ([ (.semantic.completed_quality_phases // [])[] ] | if length == 0 then "none" else join(", ") end) + "\n\n" +
-        "**Files changed:**\n" +
-          ([ (.deterministic.files_changed // [])[] | "- " + . ] | join("\n")) + "\n\n" +
-        "**Files created:**\n" +
-          ([ (.deterministic.files_created // [])[] | "- " + . ] | join("\n"))
-      ' "$STATE_FILE" 2>/dev/null || echo "## Session Context
+      # Also includes impact assessment and assumptions for the cold reviewer to challenge.
+      {
+        jq -r '
+          "## Session Context\n\n" +
+          "**Completed quality phases:** " +
+            ([ (.semantic.completed_quality_phases // [])[] ] | if length == 0 then "none" else join(", ") end) + "\n\n" +
+          "**Files changed:**\n" +
+            ([ (.deterministic.files_changed // [])[] | "- " + . ] | join("\n")) + "\n\n" +
+          "**Files created:**\n" +
+            ([ (.deterministic.files_created // [])[] | "- " + . ] | join("\n"))
+        ' "$STATE_FILE" 2>/dev/null || echo "## Session Context
 
 (state unavailable)"
+
+        # Inject impact assessment if available
+        if [ -f "$EXPLAIN_DIR/impact_assessment.md" ]; then
+          echo ""
+          echo "**Impact Assessment:**"
+          cat "$EXPLAIN_DIR/impact_assessment.md"
+        fi
+        # Inject assumptions for the cold reviewer to challenge
+        if [ -f "$EXPLAIN_DIR/assumptions.json" ]; then
+          local assumptions_content
+          assumptions_content=$(cat "$EXPLAIN_DIR/assumptions.json" 2>/dev/null)
+          if [ -n "$assumptions_content" ] && [ "$assumptions_content" != "[]" ]; then
+            echo ""
+            echo "**Unverified Assumptions (challenge these):**"
+            echo '```json'
+            echo "$assumptions_content"
+            echo '```'
+          fi
+        fi
+      }
       ;;
 
     doc_update)
@@ -1331,17 +1710,34 @@ _auto_discover_ci_checks() {
 
 # ─── Default Hooks ───────────────────────────────────────────────────────────
 
-# Default long-file finder — searches PROJECT_ROOT for common extensions,
-# excluding tests, node_modules, and dist. Projects can override by defining
-# project_find_long_files() in .auto_claude.conf.
+# Default long-file finder — searches PROJECT_ROOT for source file extensions
+# (configured via SOURCE_FILE_GLOBS), excluding tests, node_modules, and dist.
+# Projects can override by defining project_find_long_files() in .auto_claude.conf.
 _default_find_long_files() {
   local threshold="$1"
-  find "$PROJECT_ROOT" \
-    -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \
-    -o -name "*.py" -o -name "*.go" -o -name "*.rs" -o -name "*.rb" \) \
-    ! -name "*.test.*" ! -name "*.spec.*" ! -name "test_*" \
-    ! -path "*/node_modules/*" ! -path "*/__pycache__/*" ! -path "*/dist/*" \
-    -exec sh -c 'lines=$(wc -l < "$1"); if [ "$lines" -gt '"$threshold"' ]; then echo "$lines $1"; fi' _ {} \; \
+
+  # Build find -name arguments from SOURCE_FILE_GLOBS array
+  local -a find_args=("$PROJECT_ROOT" "-type" "f" "(")
+  local first=true
+  for glob in "${SOURCE_FILE_GLOBS[@]}"; do
+    if [ "$first" = true ]; then
+      first=false
+    else
+      find_args+=("-o")
+    fi
+    find_args+=("-name" "$glob")
+  done
+  find_args+=(")"
+    "!" "-name" "*.test.*"
+    "!" "-name" "*.spec.*"
+    "!" "-name" "test_*"
+    "!" "-path" "*/node_modules/*"
+    "!" "-path" "*/__pycache__/*"
+    "!" "-path" "*/dist/*"
+  )
+
+  find "${find_args[@]}" -exec sh -c \
+    'lines=$(wc -l < "$1"); if [ "$lines" -gt '"$threshold"' ]; then echo "$lines $1"; fi' _ {} \; \
     | sort -rn
 }
 
@@ -1411,6 +1807,93 @@ Output the plan as a numbered checklist."
   log OK "Planning complete"
 }
 
+phase_decisions() {
+  if [ "${EXPLAIN_PHASES:-true}" != "true" ]; then
+    log INFO "Explainability disabled — skipping decisions manifest"
+    return 0
+  fi
+
+  _ensure_explain_dir
+
+  # Build artifact context if available
+  local artifact_prompt=""
+  if [ "$HAS_ARTIFACTS" = true ]; then
+    local artifact_context
+    artifact_context=$(_filter_artifacts_for_spec)
+    if [ -n "$artifact_context" ]; then
+      artifact_prompt="Before making decisions, review these structural facts about the entities you'll be working with:
+
+${artifact_context}
+
+Factor these into your decisions. If your planned approach conflicts with any structural fact, flag it as a risk.
+
+"
+    fi
+  fi
+
+  # Check for assumptions from previous deliverables (multi-deliverable support)
+  local prior_assumptions=""
+  if [ -f "$EXPLAIN_DIR/assumptions.json" ]; then
+    local assumptions_content
+    assumptions_content=$(cat "$EXPLAIN_DIR/assumptions.json" 2>/dev/null)
+    if [ -n "$assumptions_content" ] && [ "$assumptions_content" != "[]" ] && [ "$assumptions_content" != "null" ]; then
+      prior_assumptions="The following assumptions were made in earlier deliverables.
+If your implementation depends on any of these, validate or challenge them:
+
+\`\`\`json
+${assumptions_content}
+\`\`\`
+
+"
+    fi
+  fi
+
+  run_claude "${artifact_prompt}${prior_assumptions}Before implementing, analyse each deliverable and emit a decisions manifest.
+For each deliverable, identify the key technical choices you'll make.
+
+Output ONLY valid JSON (no markdown fences, no commentary before or after):
+{
+  \"deliverables\": [
+    {
+      \"id\": \"D1\",
+      \"title\": \"...\",
+      \"decisions\": [
+        {
+          \"id\": \"D1-001\",
+          \"category\": \"data_source|pattern|module|dependency|api\",
+          \"choice\": \"What you chose to do\",
+          \"rationale\": \"Why you chose it\",
+          \"assumption\": \"What must be true for this choice to be correct\",
+          \"alternatives_considered\": [\"Other approach you rejected and why\"],
+          \"risk\": \"What could go wrong if the assumption is wrong\"
+        }
+      ]
+    }
+  ]
+}"
+
+  # Parse and save
+  local parsed
+  if parsed=$(_extract_json_from_response); then
+    if [ -n "$parsed" ]; then
+      echo "$parsed" > "$EXPLAIN_DIR/decisions.json"
+      _jq_update --argjson d "$parsed" '.semantic.decisions_manifest = $d'
+      log OK "Decisions manifest saved to $EXPLAIN_DIR/decisions.json"
+    else
+      log WARN "Could not parse decisions manifest — continuing without it"
+    fi
+  else
+    log WARN "Could not parse decisions manifest — continuing without it"
+  fi
+
+  # Optional human gate
+  if [ "${DECISIONS_REVIEW:-false}" = "true" ]; then
+    log INFO "DECISIONS_REVIEW enabled — review decisions at: $EXPLAIN_DIR/decisions.json"
+    log INFO "Press Enter to continue, or Ctrl+C to abort..."
+    read -r
+  fi
+}
+
 phase_implement() {
   run_claude "Execute the implementation plan you created in the previous step.
 Implement all changes now. Follow the plan exactly.
@@ -1431,6 +1914,7 @@ phase_test_fix() {
   if [ $preflight_exit -eq 0 ]; then
     log OK "All tests pass on pre-flight"
     _update_test_results "pass" "0"
+    _extract_coverage_map || true
     return 0
   fi
 
@@ -1502,6 +1986,7 @@ phase_test_fix() {
       log OK "All tests pass after env fixes"
       _update_test_results "pass" "0"
     fi
+    _extract_coverage_map || true
     return 0
   fi
 
@@ -1513,6 +1998,7 @@ phase_test_fix() {
     if [ $rerun_exit -eq 0 ]; then
       log OK "All tests pass after env fixes"
       _update_test_results "pass" "0"
+      _extract_coverage_map || true
       return 0
     fi
   fi
@@ -1532,6 +2018,7 @@ phase_test_fix() {
       if [ $test_exit -eq 0 ]; then
         log OK "All tests pass on iteration ${iteration}"
         _update_test_results "pass" "$iteration"
+        _extract_coverage_map || true
         return 0
       fi
     fi
@@ -1696,6 +2183,148 @@ Fix the test failures without reverting the CI fixes. Adjust the implementation 
 # Each uses run_claude_fresh for its first call (with context pack), then
 # run_claude (--continue) for subsequent calls within the same phase.
 
+phase_impact() {
+  if [ "${EXPLAIN_PHASES:-true}" != "true" ]; then
+    log INFO "Explainability disabled — skipping impact assessment"
+    return 0
+  fi
+
+  _ensure_explain_dir
+
+  if [ "$HAS_ARTIFACTS" = true ]; then
+    # Step A: Deterministic blast radius computation
+    log INFO "Computing blast radius from recovery artifacts..."
+    if _compute_blast_radius; then
+      if [ ! -f "$EXPLAIN_DIR/blast_radius.json" ]; then
+        log WARN "Blast radius computation produced no output — falling back to LLM-only"
+        _impact_llm_only
+        return 0
+      fi
+
+      # Step B: Classification gate
+      local classification
+      classification=$(jq -r '.classification // "leaf"' "$EXPLAIN_DIR/blast_radius.json" 2>/dev/null)
+      log INFO "Change classification: ${classification}"
+
+      if [ "$classification" = "leaf" ]; then
+        log OK "Leaf change — skipping impact narrative"
+        _jq_update '.semantic.impact_classification = "leaf"'
+        return 0
+      fi
+
+      # Step C: Narrative synthesis for boundary/core
+      log INFO "Generating impact narrative (${classification} change)..."
+      local blast_content
+      blast_content=$(cat "$EXPLAIN_DIR/blast_radius.json")
+
+      local context
+      context=$(_build_context_pack "skill_chain")
+
+      run_claude_fresh "${context}
+
+---
+
+You are reviewing the blast radius of a code change.
+The following impact data was computed by analysing the codebase's dependency graphs, data ownership, event contracts, and invariants.
+
+\`\`\`json
+${blast_content}
+\`\`\`
+
+Write a concise impact assessment:
+1. Which downstream systems or workflows could be affected?
+2. Are there any invariants this change could violate?
+3. Are there view/table assumptions that need verification?
+4. What specific tests or manual checks should be added?
+
+Keep it under 500 words. Be specific — cite the evidence from the blast radius data."
+
+      echo "$LAST_RESPONSE_TEXT" > "$EXPLAIN_DIR/impact_assessment.md"
+      _jq_update --arg c "$classification" '.semantic.impact_classification = $c'
+      log OK "Impact assessment saved to $EXPLAIN_DIR/impact_assessment.md"
+
+      # Core classification gate
+      if [ "$classification" = "core" ]; then
+        log WARN "CORE change detected — review impact at: $EXPLAIN_DIR/impact_assessment.md"
+        log INFO "Press Enter to continue, or Ctrl+C to abort..."
+        read -r
+      fi
+    else
+      log WARN "blast_radius.py failed — falling back to LLM-only"
+      _impact_llm_only
+    fi
+  else
+    _impact_llm_only
+  fi
+}
+
+_compute_blast_radius() {
+  local changed_files
+  changed_files=$(_state_get '.deterministic.files_changed[]' 2>/dev/null || true)
+
+  if [ -z "$changed_files" ]; then
+    log WARN "No changed files in state — skipping blast radius"
+    return 1
+  fi
+
+  # Write changed files to a temp file for blast_radius.py
+  local tmpfile
+  tmpfile=$(mktemp)
+  echo "$changed_files" > "$tmpfile"
+
+  local args=()
+  args+=(--changed-files "$tmpfile")
+  args+=(--output "$EXPLAIN_DIR/blast_radius.json")
+
+  # Add each artifact file if it exists
+  [ -f "$ARTIFACTS_DIR/system_graph.json" ] && args+=(--system-graph "$ARTIFACTS_DIR/system_graph.json")
+  [ -f "$ARTIFACTS_DIR/behaviour_graph.json" ] && args+=(--behaviour-graph "$ARTIFACTS_DIR/behaviour_graph.json")
+  [ -f "$ARTIFACTS_DIR/data_ownership.json" ] && args+=(--data-ownership "$ARTIFACTS_DIR/data_ownership.json")
+  [ -f "$ARTIFACTS_DIR/event_contracts.json" ] && args+=(--event-contracts "$ARTIFACTS_DIR/event_contracts.json")
+  [ -f "$ARTIFACTS_DIR/failure_topology.json" ] && args+=(--failure-topology "$ARTIFACTS_DIR/failure_topology.json")
+  [ -f "$ARTIFACTS_DIR/invariants.json" ] && args+=(--invariants "$ARTIFACTS_DIR/invariants.json")
+  [ -f "$ARTIFACTS_DIR/test_coverage_topology.json" ] && args+=(--test-coverage "$ARTIFACTS_DIR/test_coverage_topology.json")
+
+  python3 "$SCRIPT_DIR/blast_radius.py" "${args[@]}" 2>&1 | tee -a "$LOG_FILE"
+  local rc=${PIPESTATUS[0]}
+
+  rm -f "$tmpfile"
+  return $rc
+}
+
+_impact_llm_only() {
+  log INFO "Running LLM-only impact assessment (no recovery artifacts)"
+
+  local context
+  context=$(_build_context_pack "skill_chain")
+
+  local changed_files
+  changed_files=$(_state_get '.deterministic.files_changed[]' 2>/dev/null || echo "(unknown)")
+
+  run_claude_fresh "${context}
+
+---
+
+No recovery artifacts available — blast radius analysis is LLM-only.
+Consider running recovery analysis for this project for deterministic impact assessment.
+
+List the tables/entities this code reads and writes. For each, consider:
+1. Is it a table or a view? If a view, what does it filter?
+2. Do other parts of the system depend on it?
+3. Are there event contracts that trigger on changes to it?
+4. What are the downstream effects of this change?
+
+These files were changed:
+${changed_files}
+
+Output a brief impact assessment (under 300 words)."
+
+  _ensure_explain_dir
+  echo "$LAST_RESPONSE_TEXT" > "$EXPLAIN_DIR/impact_assessment.md"
+  _jq_update '.semantic.impact_classification = "leaf_llm_only"'
+  log OK "LLM-only impact assessment saved"
+}
+
 phase_skill_chain() {
   local context
   context=$(_build_context_pack "skill_chain")
@@ -1857,6 +2486,137 @@ ${refactor_prompt}"
   return 1
 }
 
+# Check if any file in a newline-separated list matches a glob pattern.
+# Handles JSON array globs (["*.tsx", "*.jsx"]) and bare string globs ("*.tsx").
+# Uses bash extglob and shopt globstar-style matching.
+# Returns 0 if any file matches, 1 otherwise.
+_files_match_glob() {
+  local globs_raw="$1"
+  local changed_files="$2"
+
+  # Parse globs — handle JSON array ["*.tsx", "*.jsx"] or bare string
+  local -a globs=()
+  if [[ "$globs_raw" == \[* ]]; then
+    # JSON array — extract quoted strings
+    while IFS= read -r g; do
+      globs+=("$g")
+    done < <(echo "$globs_raw" | tr -d '[]' | tr ',' '\n' | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//' | grep -v '^$')
+  elif [ -n "$globs_raw" ]; then
+    globs+=("$globs_raw")
+  fi
+
+  # No globs defined — rule has no file restriction
+  if [ ${#globs[@]} -eq 0 ]; then
+    return 0
+  fi
+
+  # Check each changed file against each glob
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    for glob in "${globs[@]}"; do
+      # Convert glob to regex: ** → .*, * → [^/]*, . → \., rest literal
+      local regex
+      regex=$(echo "$glob" | sed \
+        -e 's/\./\\./g' \
+        -e 's/\*\*/.*/g' \
+        -e 's/\([^.]\)\*/\1[^\/]*/g' \
+        -e 's/^\*/[^\/]*/g')
+      if [[ "$file" =~ ^${regex}$ ]]; then
+        return 0
+      fi
+    done
+  done <<< "$changed_files"
+
+  return 1
+}
+
+# Extract a YAML frontmatter field value from an .mdc file.
+# Usage: _mdc_field "fieldname" < file.mdc
+_mdc_field() {
+  local field="$1"
+  # Read between first and second ---, extract the field
+  sed -n '/^---$/,/^---$/p' | grep "^${field}:" | sed "s/^${field}:[[:space:]]*//"
+}
+
+# Load repo-specific review rules from .cursor/BUGBOT.md and .cursor/rules/**/*.mdc
+# .mdc files are filtered by their frontmatter globs against the changed files list.
+# alwaysApply: true rules are always included regardless of globs.
+# Returns the combined rules as a string, or empty if none found.
+_load_repo_review_rules() {
+  local changed_files="$1"
+  local rules=""
+  local found_any=false
+
+  # Load BUGBOT.md if present (always applies — it's repo-wide)
+  if [ -f "${PROJECT_ROOT}/.cursor/BUGBOT.md" ]; then
+    rules+="
+### Repo Review Rules (from .cursor/BUGBOT.md)
+
+$(cat "${PROJECT_ROOT}/.cursor/BUGBOT.md")
+"
+    log INFO "Loaded repo review rules from .cursor/BUGBOT.md"
+    found_any=true
+  fi
+
+  # Load .cursor/rules/**/*.mdc files — filter by globs and alwaysApply
+  local mdc_files
+  mdc_files=$(find "${PROJECT_ROOT}/.cursor/rules" -name "*.mdc" -type f 2>/dev/null || true)
+
+  if [ -n "$mdc_files" ]; then
+    local included_count=0
+    local skipped_count=0
+    local org_rules=""
+
+    while IFS= read -r mdc_file; do
+      local relative_path="${mdc_file#"${PROJECT_ROOT}/"}"
+
+      # Extract frontmatter fields
+      local always_apply globs_raw
+      always_apply=$(cat "$mdc_file" | _mdc_field "alwaysApply")
+      globs_raw=$(cat "$mdc_file" | _mdc_field "globs")
+
+      # Determine if this rule should be included
+      local include=false
+      if [ "$always_apply" = "true" ]; then
+        include=true
+      elif _files_match_glob "$globs_raw" "$changed_files"; then
+        include=true
+      fi
+
+      if [ "$include" = true ]; then
+        # Strip YAML frontmatter, keep body
+        local body
+        body=$(sed -n '/^---$/,/^---$/!p' "$mdc_file" | sed '1{/^$/d}')
+        if [ -n "$body" ]; then
+          org_rules+="
+#### ${relative_path}
+${body}
+"
+          log INFO "Loaded review rule: ${relative_path} ($([ "$always_apply" = "true" ] && echo "alwaysApply" || echo "glob match"))"
+          included_count=$((included_count + 1))
+        fi
+      else
+        log INFO "Skipped review rule: ${relative_path} (no glob match)"
+        skipped_count=$((skipped_count + 1))
+      fi
+    done <<< "$mdc_files"
+
+    if [ $included_count -gt 0 ]; then
+      rules+="
+### Org/Team Review Rules (from .cursor/rules/)
+${org_rules}"
+      found_any=true
+    fi
+    log INFO "Review rules: ${included_count} loaded, ${skipped_count} skipped (glob mismatch)"
+  fi
+
+  if [ "$found_any" = false ]; then
+    log INFO "No repo review rules found (.cursor/BUGBOT.md or .cursor/rules/**/*.mdc)"
+  fi
+
+  echo "$rules"
+}
+
 phase_fresh_review() {
   local changed_files
   changed_files="$(get_changed_files)"
@@ -1869,6 +2629,9 @@ phase_fresh_review() {
   local context
   context=$(_build_context_pack "fresh_review")
 
+  local repo_review_rules
+  repo_review_rules=$(_load_repo_review_rules "$changed_files")
+
   # Fresh context — the reviewer has never seen this code and evaluates it cold.
   # Context pack deliberately excludes plan_intent to avoid anchoring bias.
   run_claude_fresh "${context}
@@ -1880,6 +2643,8 @@ You are reviewing code changes in the ${PROJECT_NAME} project. You did NOT write
 IMPORTANT: Tests have already passed in the test_fix phase. Do NOT re-run tests (mix test, npm test, etc.). Only review the code and fix source files. If you make changes that could break tests, note what should be re-tested but do not run them yourself.
 
 ${FRESH_REVIEW_PREAMBLE:+${FRESH_REVIEW_PREAMBLE}
+
+}${repo_review_rules:+${repo_review_rules}
 
 }These files were changed:
 ${changed_files}
@@ -2060,6 +2825,9 @@ else
   echo "Create one with at least one test_suite_*() function." >&2
   exit 1
 fi
+
+# ─── Artifact Detection ───────────────────────────────────────────────────────
+_detect_artifacts
 
 # ─── Opinionated Mode Resolution ────────────────────────────────────────────
 # CLI flag takes precedence over conf. If neither set, defaults to false.
