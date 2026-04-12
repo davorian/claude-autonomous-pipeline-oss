@@ -53,7 +53,7 @@ MAX_REFACTOR_ROUNDS=10
 MAX_LOC=300
 MAX_CI_ITERATIONS=3
 SUITE_IDLE_TIMEOUT=120  # seconds of no new output before killing a suite; 0 = no timeout
-PHASES=(plan decisions test_intent pattern_baseline implement test_fix ci_checks impact skill_chain loc_enforcement fresh_review doc_update final)
+PHASES=(plan decisions implement test_fix ci_checks impact skill_chain loc_enforcement fresh_review doc_update final)
 
 # Tiered escalation thresholds. Each value is the iteration where a new tier begins.
 # Tier 1 (tactical):  iterations 1 to TIER_2_AT-1
