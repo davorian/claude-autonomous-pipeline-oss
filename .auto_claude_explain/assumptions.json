@@ -1,0 +1,82 @@
+[
+  {
+    "id": "A001",
+    "assumption": "phase_test_intent and phase_pattern_baseline appear before SEAM_AFTER=ci_checks in the PHASES array, so the main loop dispatches them with run_claude (--continue) in the authoring conversation, not run_claude_fresh",
+    "depends_on": null,
+    "verified_by": null,
+    "impact_if_wrong": "If the phases were placed after the seam, they would get fresh sessions without plan/decisions context. The TDD tests would be written without awareness of the plan, and pattern baseline would be derived without knowing which files will change.",
+    "suggested_verification": "grep '^PHASES=' bin/auto_claude and confirm test_intent and pattern_baseline appear before ci_checks in the array"
+  },
+  {
+    "id": "A002",
+    "assumption": "_load_ownership_manifest is called after PROJECT_ROOT is set but before any phase function runs, so the OWNERSHIP_ globals are available when phase_plan and phase_implement execute",
+    "depends_on": null,
+    "verified_by": null,
+    "impact_if_wrong": "OWNERSHIP_ globals would be empty even when a manifest exists, and ownership context would never appear in prompts. The boundary enforcement would silently fail.",
+    "suggested_verification": "Read the main flow and confirm _load_ownership_manifest is called between PROJECT_ROOT assignment and the phase dispatch loop"
+  },
+  {
+    "id": "A003",
+    "assumption": "The authoring conversation context window is large enough to hold plan + decisions + test_intent (writing tests + intent map) + pattern_baseline (pattern cataloguing) + implement (writing code) without losing the plan from effective attention",
+    "depends_on": null,
+    "verified_by": null,
+    "impact_if_wrong": "Adding two more authoring-block phases increases total tokens before the seam. For very large specs, Claude may lose awareness of early plan context by the time phase_implement runs, leading to implementation that drifts from the plan.",
+    "suggested_verification": "Run the pipeline on a large spec and check whether phase_implement's output references plan items from early in the conversation"
+  },
+  {
+    "id": "A004",
+    "assumption": "The ESCALATION_ENABLED=false flat loop at phase_test_fix line 2771 is a verbatim copy of the pre-change loop and produces identical behaviour to the original",
+    "depends_on": null,
+    "verified_by": null,
+    "impact_if_wrong": "Users who disable escalation for backward compatibility would get different test_fix behaviour than the original pipeline. Since test_fix is the most-exercised phase in practice, any divergence could cause real failures.",
+    "suggested_verification": "diff the flat loop body against the original pre-change test_fix loop from git history"
+  },
+  {
+    "id": "A005",
+    "assumption": "jq -r '(.owns // [])[]' correctly emits one file path per line from the ownership manifest, and these paths do not contain newlines or other characters that would break the newline-separated OWNERSHIP_ globals",
+    "depends_on": null,
+    "verified_by": null,
+    "impact_if_wrong": "File paths with special characters would corrupt the OWNERSHIP_ globals, causing _build_ownership_context to produce malformed prompt text and the boundary enforcement to fail silently.",
+    "suggested_verification": "Create a manifest with paths containing spaces and verify _load_ownership_manifest sets the globals correctly"
+  },
+  {
+    "id": "A006",
+    "assumption": "When phase_test_intent calls _run_all_suites for red-phase verification, it does not interfere with the test_fix phase's later calls to _run_all_suites — specifically, it does not leave stale LAST_FAILED_SUITES or LAST_TEST_OUTPUT values that persist into phase_implement or phase_test_fix",
+    "depends_on": null,
+    "verified_by": null,
+    "impact_if_wrong": "If red-phase verification's _run_all_suites output persists, phase_test_fix's pre-flight could see stale test output from the red phase rather than fresh results against the implementation. This could cause the wrong suites to be diagnosed.",
+    "suggested_verification": "Confirm that phase_test_fix's pre-flight _run_all_suites call at line 2674 overwrites LAST_FAILED_SUITES and LAST_TEST_OUTPUT unconditionally"
+  },
+  {
+    "id": "A007",
+    "assumption": "The _extract_json_from_response 3-tier extractor (raw → markdown fence → brace extraction) correctly parses the intent map JSON even when it appears after Claude's test-writing prose, because brace extraction finds the first { to last } in the response",
+    "depends_on": null,
+    "verified_by": null,
+    "impact_if_wrong": "If the test-writing prose contains curly braces (e.g. TypeScript code in the response), brace extraction could grab the wrong JSON object. The intent map would fail to parse, and phase_implement would fall back to the non-TDD prompt.",
+    "suggested_verification": "Examine _extract_json_from_response and confirm tier 3 brace extraction handles nested braces correctly, or check that the intent map prompt asks for JSON as the last output"
+  },
+  {
+    "id": "A008",
+    "assumption": "The pattern conformance step in phase_skill_chain uses run_claude (not run_claude_fresh), so it continues the skill_chain conversation that was started by the coding review's run_claude_fresh call",
+    "depends_on": null,
+    "verified_by": null,
+    "impact_if_wrong": "If _run_pattern_conformance accidentally used run_claude_fresh, it would lose the coding review's conversation context and Claude would not know which files were just reviewed. The conformance review would be less effective.",
+    "suggested_verification": "Read _run_pattern_conformance and confirm it calls run_claude (not run_claude_fresh)"
+  },
+  {
+    "id": "A009",
+    "assumption": "The boundary fence pre-commit hook in worktree_auto_claude does not fire when git cherry-pick --no-verify is used, because --no-verify skips all hooks including pre-commit",
+    "depends_on": null,
+    "verified_by": null,
+    "impact_if_wrong": "If --no-verify did not skip the pre-commit hook, cherry-picks that touch fenced files (which is expected during the merge phase) would fail. The worktree merge phase would break.",
+    "suggested_verification": "Confirm that git commit --no-verify bypasses pre-commit hooks, then confirm cherry_pick_commits in worktree_auto_claude uses --no-verify"
+  },
+  {
+    "id": "A010",
+    "assumption": "The _build_ownership_context conditional expansion ${ownership_context:+${ownership_context}\\n\\n} correctly produces empty output when _build_ownership_context returns nothing (exit 0 with no stdout), and does not inject stray whitespace or newlines into the prompt",
+    "depends_on": null,
+    "verified_by": null,
+    "impact_if_wrong": "If _build_ownership_context echoes whitespace on the 'return 0' path, the prompt would contain stray blank lines between PLAN_CONTEXT and the spec section. This is cosmetic but could confuse Claude's parsing of the prompt structure.",
+    "suggested_verification": "Test _build_ownership_context with all OWNERSHIP_ vars empty and confirm the output is literally empty (zero bytes)"
+  }
+]

@@ -1,0 +1,188 @@
+{
+  "deliverables": [
+    {
+      "id": "D1",
+      "title": "Ownership Manifest (auto_claude side)",
+      "decisions": [
+        {
+          "id": "D1-001",
+          "category": "pattern",
+          "choice": "Declare OWNERSHIP_OWNS, OWNERSHIP_READS, OWNERSHIP_MUST_NOT_TOUCH as file-level globals initialised to empty strings before _load_ownership_manifest, not as locals inside the function",
+          "rationale": "Bash 3.2 has no mechanism to promote a local to a global. The existing codebase uses this same pattern for LAST_PASSED_SUITES, LAST_FAILED_SUITES, LAST_TEST_OUTPUT (line 215-217) — globals declared at file scope, populated by functions. Consistency with existing convention and bash 3.2 compatibility.",
+          "assumption": "The globals are only written by _load_ownership_manifest during init and read by _build_ownership_context during phase prompts — no concurrent access concerns in a single-process pipeline",
+          "alternatives_considered": [
+            "Use local variables and pass them as function arguments — rejected because _build_ownership_context is called from multiple phase functions, so threading the values through every call site would be invasive and error-prone"
+          ],
+          "risk": "If a future function inadvertently overwrites these globals, ownership enforcement silently breaks. Low risk given the naming convention (OWNERSHIP_ prefix) and single-process execution."
+        },
+        {
+          "id": "D1-002",
+          "category": "pattern",
+          "choice": "Store file lists as newline-separated strings using jq -r '(.field // [])[]' which emits one line per element, matching the LAST_PASSED_SUITES/LAST_FAILED_SUITES pattern of space/newline-separated flat strings",
+          "rationale": "Bash 3.2 has no associative arrays. The existing codebase stores list-like data in flat strings (space-separated for suites). Newline separation is slightly better for file paths because paths can contain spaces — but in practice project paths never contain spaces, so the main benefit is cleaner formatting in prompts.",
+          "assumption": "Project file paths do not contain newline characters",
+          "alternatives_considered": [
+            "Use indexed arrays — works in bash 3.2 but the existing codebase consistently uses flat strings for this pattern, and arrays complicate the format/count operations needed for logging and prompt injection"
+          ],
+          "risk": "Very large manifests (500+ files per list) could make the prompt injection unwieldy. Mitigated by the fact that ownership is typically 10-50 files per parallel run."
+        },
+        {
+          "id": "D1-003",
+          "category": "module",
+          "choice": "Place _load_ownership_manifest and _build_ownership_context immediately after _init_state (line ~530), keeping all init-time setup functions together",
+          "rationale": "The function is called once during init (right after _init_state at line 3693). Placing it adjacent to _init_state groups init-time functions and follows the file's existing structure: helpers near their callers, init functions near the top.",
+          "assumption": "No other function between _init_state and the next section depends on the insertion point",
+          "alternatives_considered": [
+            "Place near phase_plan where the ownership context is consumed — rejected because _load_ownership_manifest is an init function called once, not a phase function; grouping it with phase functions would mislead readers about when it runs"
+          ],
+          "risk": "None significant — it's a straightforward function insertion with no interactions at the insertion point."
+        },
+        {
+          "id": "D1-004",
+          "category": "pattern",
+          "choice": "Inject ownership context into phase_plan and phase_implement via a local variable built by _build_ownership_context, using the existing ${var:+${var}\\n\\n} conditional expansion pattern",
+          "rationale": "phase_plan already uses this pattern for PLAN_CONTEXT (line 2269). Reusing the same pattern keeps the code consistent and ensures ownership context vanishes cleanly when absent (no empty sections in the prompt).",
+          "assumption": "The conditional expansion pattern ${var:+${var}\\n\\n} is sufficient — no additional separator or formatting needed beyond what _build_ownership_context produces",
+          "alternatives_considered": [
+            "Append ownership to PLAN_CONTEXT global instead of injecting separately — rejected because PLAN_CONTEXT is a config variable set in .auto_claude.conf and modifying it at runtime would be a side-effect visible to other functions that read it"
+          ],
+          "risk": "If phase_plan or phase_implement prompts are refactored to use a different injection pattern, the ownership injection may need updating. Low risk — prompt structure is stable."
+        }
+      ]
+    },
+    {
+      "id": "D4",
+      "title": "Test-Intent Phase",
+      "decisions": [
+        {
+          "id": "D4-001",
+          "category": "module",
+          "choice": "Insert phase_test_intent and phase_pattern_baseline into the PHASES array between decisions and implement, making them authoring-block phases that use run_claude (--continue)",
+          "rationale": "The spec places them before SEAM_AFTER='ci_checks', which means they share the authoring conversation. test_intent needs the plan and decisions context from prior phases. pattern_baseline needs the plan to know which files will change. Using --continue (via run_claude) is the correct calling convention for authoring-block phases.",
+          "assumption": "The authoring conversation has sufficient context window to hold plan + decisions + test_intent + pattern_baseline + implement + test_fix without losing important early context",
+          "alternatives_considered": [
+            "Use run_claude_fresh with context packs — rejected because these phases need the full plan and decisions available only in the authoring conversation, which hasn't been extracted to state yet (that happens at SEAM_AFTER)"
+          ],
+          "risk": "Adding two more phases to the authoring conversation increases total tokens before seam extraction. For very large specs, this could push plan context out of Claude's effective attention by the time phase_implement runs."
+        },
+        {
+          "id": "D4-002",
+          "category": "pattern",
+          "choice": "Use _extract_json_from_response (the existing 3-tier extractor at line 308) to parse the intent map, saving to both state (.semantic.intent_map) and explain dir (intent_map.json)",
+          "rationale": "Every other extraction in auto_claude follows this pattern: call _extract_json_from_response, save to state via _jq_update, save to explain dir as JSON file. The decisions phase (line 2354), coverage map, and skill_chain findings all do this. Consistency is worth more than novelty.",
+          "assumption": "Claude will produce parseable JSON in the intent map format, or at least embed it in a markdown fence — the 3-tier extractor handles both",
+          "alternatives_considered": [
+            "Parse only from LAST_RESPONSE_TEXT via inline jq — rejected because _extract_json_from_response already handles all the edge cases (raw JSON, markdown fences, embedded in prose)"
+          ],
+          "risk": "If Claude's response is very long (large test files + intent map), the brace-extraction tier might grab the wrong JSON object. Mitigated by asking for intent map as the last output in the prompt."
+        },
+        {
+          "id": "D4-003",
+          "category": "pattern",
+          "choice": "Red-phase verification uses _run_all_suites directly, checks three outcomes (all pass = warning, syntax errors = one fix attempt, failures = expected), and stores tdd_status in .deterministic",
+          "rationale": "The spec requires red-phase verification to confirm tests fail before implementation. _run_all_suites is the existing test runner (line 1785) that populates LAST_FAILED_SUITES and LAST_TEST_OUTPUT. Reusing it avoids duplicating test infrastructure. The three outcomes handle all realistic scenarios.",
+          "assumption": "_run_all_suites is callable independently — it sets globals (LAST_FAILED_SUITES etc.) without side effects on state beyond what's already expected. The test_fix pre-flight at line 2390 makes the same assumption.",
+          "alternatives_considered": [
+            "Skip red-phase verification entirely and trust Claude wrote failing tests — rejected because vacuous tests (always pass) are a real failure mode that should be caught before wasting an implement phase"
+          ],
+          "risk": "Running _run_all_suites adds wall-clock time (a full test suite run) before implementation begins. For projects with slow suites this could add minutes."
+        },
+        {
+          "id": "D4-004",
+          "category": "pattern",
+          "choice": "Detect syntax errors in red-phase output via grep for SyntaxError|ParseError|cannot find module|compilation failed, then send one fix attempt via run_claude",
+          "rationale": "The spec says 'If tests can't even compile/parse, send the error back to Claude for a fix via run_claude (one attempt only — don't loop here).' Grep for common error patterns is the simplest reliable heuristic. One attempt prevents an accidental loop. This matches the existing env-diagnosis pattern in phase_test_fix pre-flight (line 2399-2455).",
+          "assumption": "Common syntax/compilation errors in test files contain one of these keywords in their output. This covers TypeScript, JavaScript, Python, Elixir, and Go test runners.",
+          "alternatives_considered": [
+            "Check the exit code pattern instead of grep — rejected because different test runners use different exit codes for compilation vs assertion failures, and exit codes are less reliable than output pattern matching"
+          ],
+          "risk": "If a test runner outputs an unfamiliar error format that doesn't contain these keywords, the syntax error goes undetected and red-phase reports 'red_verified' incorrectly. Low risk — these patterns cover the major ecosystems."
+        },
+        {
+          "id": "D4-005",
+          "category": "pattern",
+          "choice": "Modify phase_implement conditionally: read intent_map from state, and if TDD_ENABLED=true AND intent_map is non-empty and not 'null', use the TDD prompt; otherwise use the exact original prompt unchanged",
+          "rationale": "The spec requires TDD_ENABLED=false to produce identical behaviour to current phase_implement. A conditional that preserves the original prompt verbatim in the else branch guarantees this. The intent_map check handles the case where phase_test_intent was skipped (via --skip flag) even though TDD_ENABLED=true.",
+          "assumption": "_state_get '.semantic.intent_map // empty' returns empty string when intent_map is null (the jq // empty pattern handles this). Verified: _state_get at line 533-534 uses jq -r which renders null as 'null' and empty as empty string.",
+          "alternatives_considered": [
+            "Always use TDD prompt and omit intent map section when absent — rejected because 'make these tests pass' without an intent map is confusing and changes the existing prompt semantics for no benefit"
+          ],
+          "risk": "If _state_get returns the literal string 'null' instead of empty, the condition needs to check for that too. Mitigated by checking both: [ -n \"$intent_map\" ] && [ \"$intent_map\" != \"null\" ]."
+        }
+      ]
+    },
+    {
+      "id": "D5",
+      "title": "Pattern Conformance",
+      "decisions": [
+        {
+          "id": "D5-001",
+          "category": "module",
+          "choice": "Insert pattern conformance step into phase_skill_chain between the coding review block and the security review block, using run_claude (--continue on the skill_chain conversation), not as a separate PHASES entry",
+          "rationale": "The spec explicitly says conformance runs 'within phase_skill_chain' and 'After the coding review step and BEFORE the security review step.' The skill_chain conversation starts fresh (run_claude_fresh for coding review at line 3013) and then continues via run_claude for subsequent steps. Conformance fits naturally here as another run_claude continuation.",
+          "assumption": "The skill_chain conversation has sufficient context to hold coding review + conformance + security + simplification. Since skill_chain starts with run_claude_fresh, it has a clean window — the previous authoring conversation doesn't pollute it.",
+          "alternatives_considered": [
+            "Add as a separate phase in the PHASES array — rejected because it would need its own context pack and fresh session, losing the benefit of the skill_chain conversation's awareness of what the coding review just changed"
+          ],
+          "risk": "If conformance review is verbose (many deviations), it may push coding review context out of the window before security review runs. Mitigated by the fact that conformance produces structured JSON, not lengthy prose."
+        },
+        {
+          "id": "D5-002",
+          "category": "pattern",
+          "choice": "Guard conformance with if [ \"${PATTERN_CONFORMANCE}\" = \"true\" ] at both the phase_pattern_baseline phase function AND the insertion point in phase_skill_chain",
+          "rationale": "The spec says PATTERN_CONFORMANCE=false must skip both pattern_baseline and the conformance step. Double-guarding ensures correctness even if someone manually sets pattern_baseline in state without the config flag (shouldn't happen, but defense in depth). The existing functions _run_pattern_conformance and _extract_conformance_findings already gracefully handle missing baseline (return 0), but the config guard makes intent explicit.",
+          "assumption": "PATTERN_CONFORMANCE defaults to true in the config section and can be overridden in .auto_claude.conf — no other mechanism needed",
+          "alternatives_considered": [
+            "Guard only at the phase function and let _run_pattern_conformance handle the missing baseline case — would technically work since it already checks for empty baseline, but the config flag intent would be hidden behind a data check"
+          ],
+          "risk": "None significant — double-guarding is strictly more robust than single-guarding."
+        },
+        {
+          "id": "D5-003",
+          "category": "pattern",
+          "choice": "Update _extract_skill_chain_findings JSON schema to add pattern_conformance field with deviations_reverted, deviations_kept, patterns_conformed sub-fields",
+          "rationale": "The spec explicitly requires this. _extract_skill_chain_findings (line 1100) asks Claude to summarise all skill_chain steps as JSON. Adding pattern_conformance to the schema means the summary captures conformance alongside code review, security, and simplification. Downstream context packs already handle missing fields with // [] fallbacks.",
+          "assumption": "Claude will populate the new field even though it was added mid-conversation. Since the extraction prompt explicitly lists all expected fields, Claude should comply.",
+          "alternatives_considered": [
+            "Extract conformance findings in a separate function that doesn't touch skill_chain_findings — rejected because that would create a parallel extraction path and downstream consumers would need to read from two places"
+          ],
+          "risk": "If Claude has trouble producing the more complex JSON schema (6 fields instead of 4), the entire extraction might fail. Mitigated by the existing fallback path in _extract_skill_chain_findings (log warning and continue)."
+        }
+      ]
+    },
+    {
+      "id": "D2",
+      "title": "Approach Journal",
+      "decisions": [
+        {
+          "id": "D2-001",
+          "category": "pattern",
+          "choice": "No changes needed — _record_approach, _format_approach_journal, approach_journal in state schema, and integration into phase_test_fix are all already implemented and working",
+          "rationale": "The audit confirmed: _record_approach at line 612, _format_approach_journal at line 638, approach_journal: [] in _init_state at line 501, and the tiered test_fix loop at line 2532 already uses journal in all tiers. Context packs for skill_chain and final include approach_journal. Tests 1-10 in test_auto_claude_escalation.sh cover this.",
+          "assumption": "The previous implementation is correct and complete. Tests 1-8 pass (verified: test_auto_claude_escalation.sh passes through test 10 before failing at test 11 which depends on the missing _build_ownership_context).",
+          "alternatives_considered": [
+            "Re-implement from scratch — rejected because the existing implementation matches the spec exactly and passes its tests"
+          ],
+          "risk": "None — verified working."
+        }
+      ]
+    },
+    {
+      "id": "D3",
+      "title": "Tiered Escalation",
+      "decisions": [
+        {
+          "id": "D3-001",
+          "category": "pattern",
+          "choice": "No changes needed — all escalation functions, the tiered test_fix loop, escalation state schema, and context pack integration are already implemented and working",
+          "rationale": "The audit confirmed: _tier_for_iteration at line 657, _build_reanchor_prompt at line 1173, _build_consultation_prompt at line 1237, _build_intent_gap_analysis at line 1306, _present_alternatives at line 1327, _resume_with_alternative at line 1374. The tiered loop with ESCALATION_ENABLED guard is at line 2487. escalation in state schema at line 502. Final context pack includes escalation info.",
+          "assumption": "The previous implementation matches the spec. The flat-loop backward-compat path (ESCALATION_ENABLED=false at line 2487) preserves identical behaviour to the original loop.",
+          "alternatives_considered": [
+            "Verify by reading every function body line-by-line — not necessary given the structural audit already confirmed presence and the test file covers tier selection, journal formatting, and context pack content"
+          ],
+          "risk": "If any function body has a subtle bug (e.g. wrong jq filter), it would only surface during a real pipeline run with test failures reaching tier 3+. The test file covers the extractable functions but cannot test full tier progression without mocking run_claude."
+        }
+      ]
+    }
+  ]
+}

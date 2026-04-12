@@ -1,0 +1,506 @@
+{
+  "covered": [
+    {
+      "requirement": "D1-T7: _load_ownership_manifest correctly reads manifest and sets globals from env var",
+      "test": "tests/test_auto_claude_ownership.sh:51",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D1-T8: Standalone auto_claude (no manifest, no env var) runs unchanged — no errors, no ownership injection",
+      "test": "tests/test_auto_claude_ownership.sh:95",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D1-T8 (variant): Manifest present but no AUTO_CLAUDE_RUN_NAME — standalone mode",
+      "test": "tests/test_auto_claude_ownership.sh:115",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D1-T8 (variant): Manifest present but run name not in manifest",
+      "test": "tests/test_auto_claude_ownership.sh:137",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D1-T3: Boundary fence pre-commit hook rejects changes to fenced files with clear error message",
+      "test": "tests/test_auto_claude_ownership.sh:159",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D1-T4: Boundary fence allows changes to owned files",
+      "test": "tests/test_auto_claude_ownership.sh:196",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D1-T5: Boundary fence allows changes to files not in any list (new files created by this run)",
+      "test": "tests/test_auto_claude_ownership.sh:209",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D1-T9: Post-merge reconciliation detects TODO(boundary) comments and logs them",
+      "test": "tests/test_auto_claude_ownership.sh:245",
+      "confidence": "indirect"
+    },
+    {
+      "requirement": "D2-T2: _format_approach_journal returns empty string when journal is empty",
+      "test": "tests/test_auto_claude_escalation.sh:155",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D2-T3: _format_approach_journal returns formatted list when journal has entries",
+      "test": "tests/test_auto_claude_escalation.sh:175",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D2-T7: Approach journal appears in skill_chain context pack",
+      "test": "tests/test_auto_claude_escalation.sh:204",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D2-T8: Approach journal appears in final context pack",
+      "test": "tests/test_auto_claude_escalation.sh:232",
+      "confidence": "indirect"
+    },
+    {
+      "requirement": "D2-T9: State file schema remains valid JSON after journal entries are added",
+      "test": "tests/test_auto_claude_escalation.sh:175",
+      "confidence": "indirect"
+    },
+    {
+      "requirement": "D2 state schema: approach_journal initialised as empty array in _init_state",
+      "test": "tests/test_auto_claude_escalation.sh:67",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D3-T1: _tier_for_iteration returns 1 for iterations 1-2, 2 for 3, 3 for 4, 4 for 5 (default thresholds)",
+      "test": "tests/test_auto_claude_escalation.sh:107",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D3-T2: _tier_for_iteration respects custom thresholds set in .auto_claude.conf",
+      "test": "tests/test_auto_claude_escalation.sh:132",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D3-T15: State file records escalation.tier_reached as highest tier reached",
+      "test": "tests/test_auto_claude_escalation.sh:232",
+      "confidence": "indirect"
+    },
+    {
+      "requirement": "D3-T17: Final context pack includes escalation info when tier_reached > 1",
+      "test": "tests/test_auto_claude_escalation.sh:232",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D3-T16: If tests pass at tier 1, no escalation occurs (fast path unchanged) — final pack says 'No escalation needed'",
+      "test": "tests/test_auto_claude_escalation.sh:263",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D3 state schema: escalation initialised with tier_reached=0 in _init_state",
+      "test": "tests/test_auto_claude_escalation.sh:84",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D4 state schema: tdd_status initialised as null in _init_state",
+      "test": "tests/test_auto_claude_escalation.sh:88",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D4 state schema: intent_map initialised as null in _init_state",
+      "test": "tests/test_auto_claude_escalation.sh:92",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D5 state schema: pattern_baseline initialised as null in _init_state",
+      "test": "tests/test_auto_claude_escalation.sh:96",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D5 state schema: conformance_findings initialised as null in _init_state",
+      "test": "tests/test_auto_claude_escalation.sh:100",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D5-T12: final context pack includes conformance summary (reverted + kept)",
+      "test": "tests/test_auto_claude_escalation.sh:286",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D5-T11: fresh_review context pack includes deviation findings with 'challenge this' instruction",
+      "test": "tests/test_auto_claude_escalation.sh:314",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D1-T11: _build_ownership_context returns empty when no ownership loaded",
+      "test": "tests/test_auto_claude_escalation.sh:341",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D1-T11: _build_ownership_context returns formatted context with OWN/READ/MUST NOT TOUCH sections",
+      "test": "tests/test_auto_claude_escalation.sh:357",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "D2 context pack: empty journal shows '(no iterations needed)' in skill_chain pack",
+      "test": "tests/test_auto_claude_escalation.sh:378",
+      "confidence": "direct"
+    },
+    {
+      "requirement": "PHASES array contains all 13 phases in correct order including test_intent and pattern_baseline",
+      "test": "tests/test_auto_claude_state.sh:64",
+      "confidence": "indirect"
+    }
+  ],
+  "uncovered": [
+    {
+      "requirement": "D1-T1: Manifest generation produces valid JSON with runs key containing each run name",
+      "source": "D1 Tests item 1",
+      "severity": "medium",
+      "reason": "_generate_ownership_manifest calls claude -p which requires a live Claude session. Cannot be unit-tested without mocking the Claude CLI. The function exists and the JSON extraction logic is the same 3-tier pattern used elsewhere, but no test validates the end-to-end manifest output."
+    },
+    {
+      "requirement": "D1-T2: Each run's owns + reads + must_not_touch covers all spec-mentioned files",
+      "source": "D1 Tests item 2",
+      "severity": "low",
+      "reason": "This is a quality-of-output check on Claude's response, not a code correctness check. Cannot be tested without a live pipeline run."
+    },
+    {
+      "requirement": "D1-T6: AUTO_CLAUDE_RUN_NAME is exported to worktree Terminal sessions",
+      "source": "D1 Tests item 6",
+      "severity": "low",
+      "reason": "The export is in the osascript command at worktree_auto_claude:537. Verified by code inspection but no test exercises the osascript launch path (requires macOS Terminal.app)."
+    },
+    {
+      "requirement": "D1-T10: Manifest generation failure degrades gracefully (warning, no fence, pipeline continues)",
+      "source": "D1 Tests item 10",
+      "severity": "medium",
+      "reason": "The code has the graceful degradation path (log WARN + return 0 at worktree_auto_claude:877 and :912) but no test exercises it. Would require mocking claude -p to return non-zero or unparseable output."
+    },
+    {
+      "requirement": "D1-T11: phase_plan and phase_implement prompts include ownership section when manifest is loaded",
+      "source": "D1 Tests item 11",
+      "severity": "medium",
+      "reason": "The ownership injection code exists in phase_plan and phase_implement, but no test verifies the prompt text. Would require mocking run_claude and capturing the prompt argument. _build_ownership_context is tested but the integration with phase_plan/phase_implement is not."
+    },
+    {
+      "requirement": "D2-T1: _record_approach appends valid entry to .deterministic.approach_journal[] with iteration number",
+      "source": "D2 Tests item 1",
+      "severity": "high",
+      "reason": "_record_approach calls run_claude (requires live Claude session) then _extract_json_from_response. The function exists at line 672 but no test exercises it — even the fallback path (parse failure → append fallback entry) is untested. The format_approach_journal test validates reading, not writing."
+    },
+    {
+      "requirement": "D2-T4: Extraction failure produces fallback entry (not a hard error, pipeline continues)",
+      "source": "D2 Tests item 4",
+      "severity": "high",
+      "reason": "_record_approach has a fallback path at line 690 that appends {iteration, summary: '(extraction failed)', error_class: 'unknown', files_touched: []}. No test exercises this path."
+    },
+    {
+      "requirement": "D2-T5: Approach journal appears in test_fix prompts from iteration 2 onwards",
+      "source": "D2 Tests item 5",
+      "severity": "medium",
+      "reason": "The tiered loop at line 2849 calls _format_approach_journal and prepends it to the prompt. This is structural code that requires a live pipeline to exercise — the journal formatting is tested, but the integration into the test_fix prompt is not."
+    },
+    {
+      "requirement": "D2-T6: Approach journal does NOT appear in iteration 1 prompt (nothing to report yet)",
+      "source": "D2 Tests item 6",
+      "severity": "low",
+      "reason": "On iteration 1, _format_approach_journal returns empty string (journal is empty), and the ${journal:+...} conditional expansion produces nothing. Tested indirectly via test 4 (empty journal returns empty), but not via the phase_test_fix integration."
+    },
+    {
+      "requirement": "D3-T3: ESCALATION_ENABLED=false uses the existing flat loop — identical behaviour to current",
+      "source": "D3 Tests item 3",
+      "severity": "high",
+      "reason": "The flat loop exists at line 2771 gated behind ESCALATION_ENABLED != true, but no test verifies it runs identically to the pre-change loop. This is a critical backward-compatibility guarantee."
+    },
+    {
+      "requirement": "D3-T4: Tier 1 prompt includes approach journal from iteration 2 onwards",
+      "source": "D3 Tests item 4",
+      "severity": "medium",
+      "reason": "Requires live pipeline execution to verify prompt content. The code at line 2849 calls _format_approach_journal but no test captures the prompt."
+    },
+    {
+      "requirement": "D3-T5: Tier 2 prompt includes spec content, decisions manifest, approach journal, and intent map (when available)",
+      "source": "D3 Tests item 5",
+      "severity": "medium",
+      "reason": "_build_reanchor_prompt exists at line 1238 and reads spec, decisions, journal, intent map. No test validates the assembled prompt content."
+    },
+    {
+      "requirement": "D3-T6: Tier 2 prompt works without intent map (graceful degradation)",
+      "source": "D3 Tests item 6",
+      "severity": "medium",
+      "reason": "_build_reanchor_prompt handles absent intent_map (line 1262: if non-empty and not null), but no test verifies this path."
+    },
+    {
+      "requirement": "D3-T7: Tier 3 launches a fresh session (run_claude_fresh, not --continue) and outputs parseable alternatives JSON",
+      "source": "D3 Tests item 7",
+      "severity": "medium",
+      "reason": "The code at line 2878 calls run_claude_fresh with _build_consultation_prompt. Requires live Claude to test."
+    },
+    {
+      "requirement": "D3-T8: Tier 3 parse failure degrades gracefully to tactical fix with warning",
+      "source": "D3 Tests item 8",
+      "severity": "medium",
+      "reason": "The fallback path exists at line 2893-2907 (log WARN, fall back to tactical fix). No test exercises it."
+    },
+    {
+      "requirement": "D3-T9: Tier 4 _present_alternatives prints formatted menu with intent gap analysis to terminal",
+      "source": "D3 Tests item 9",
+      "severity": "low",
+      "reason": "_present_alternatives at line 1392 prints to stderr and reads from stdin. Cannot be unit-tested without I/O mocking."
+    },
+    {
+      "requirement": "D3-T10: Tier 4 choice Q aborts pipeline with escalation_abort status in test_results",
+      "source": "D3 Tests item 10",
+      "severity": "medium",
+      "reason": "The Q path exists at line 2966 calling _update_test_results 'escalation_abort'. No test exercises it."
+    },
+    {
+      "requirement": "D3-T11: Tier 4 choice R retries with tactical fix",
+      "source": "D3 Tests item 11",
+      "severity": "low",
+      "reason": "The R path exists at line 2947. Requires interactive input + live Claude."
+    },
+    {
+      "requirement": "D3-T12: Tier 4 choice A/B/C passes correct alternative JSON to _resume_with_alternative",
+      "source": "D3 Tests item 12",
+      "severity": "medium",
+      "reason": "The A/B/C dispatch exists at line 2926-2945. No test validates the jq extraction of the correct alternative from state."
+    },
+    {
+      "requirement": "D3-T13: _resume_with_alternative re-injects test output alongside the new approach",
+      "source": "D3 Tests item 13",
+      "severity": "medium",
+      "reason": "_resume_with_alternative at line 1439 builds a prompt with the alternative + test output. No test validates the prompt content."
+    },
+    {
+      "requirement": "D3-T14: _resume_with_alternative records chosen alternative in state",
+      "source": "D3 Tests item 14",
+      "severity": "medium",
+      "reason": "The code at line 1453 calls _jq_update to record the choice. No test verifies state is written."
+    },
+    {
+      "requirement": "D4-T1: phase_test_intent writes test files without implementation code",
+      "source": "D4 Tests item 1",
+      "severity": "low",
+      "reason": "This is a quality-of-output check on Claude's response to the TDD prompt. Cannot be tested without a live pipeline run."
+    },
+    {
+      "requirement": "D4-T2: phase_test_intent outputs parseable intent map JSON with test_file, layer, deliverable, intents",
+      "source": "D4 Tests item 2",
+      "severity": "medium",
+      "reason": "The parsing code exists at line 2527 using _extract_json_from_response. No test validates the parsing path with mock data."
+    },
+    {
+      "requirement": "D4-T3: Intent map is saved to both state file and explain dir",
+      "source": "D4 Tests item 3",
+      "severity": "medium",
+      "reason": "Code at lines 2529-2532 saves to both locations. No test validates this dual-save."
+    },
+    {
+      "requirement": "D4-T4: Red-phase verification runs tests and confirms new tests fail",
+      "source": "D4 Tests item 4",
+      "severity": "medium",
+      "reason": "Code at line 2543 calls _run_all_suites. Requires live test infrastructure to exercise."
+    },
+    {
+      "requirement": "D4-T5: Red-phase: if all tests pass, logs warning about vacuous/pre-existing tests",
+      "source": "D4 Tests item 5",
+      "severity": "medium",
+      "reason": "Path at line 2545-2547 sets tdd_status='warning_all_pass'. No test exercises this."
+    },
+    {
+      "requirement": "D4-T6: Red-phase: if tests have syntax errors, sends error to Claude for one fix attempt",
+      "source": "D4 Tests item 6",
+      "severity": "medium",
+      "reason": "Path at line 2550-2561 greps for SyntaxError and calls run_claude. Requires live Claude."
+    },
+    {
+      "requirement": "D4-T7: TDD_ENABLED=false skips the phase entirely — existing behaviour preserved",
+      "source": "D4 Tests item 7",
+      "severity": "high",
+      "reason": "The guard at line 2446-2449 returns 0 when TDD_ENABLED != true. No test verifies this skip path. This is a critical backward-compatibility guarantee."
+    },
+    {
+      "requirement": "D4-T8: TDD_LAYERS='unit' only writes unit tests (no integration/component/e2e)",
+      "source": "D4 Tests item 8",
+      "severity": "low",
+      "reason": "TDD_LAYERS is injected into the prompt text. Claude's compliance is a prompt quality issue, not a code correctness issue."
+    },
+    {
+      "requirement": "D4-T9: TDD_LAYERS='unit,integration,component,e2e' writes all four layers",
+      "source": "D4 Tests item 9",
+      "severity": "low",
+      "reason": "Same as T8 — prompt injection, not code logic."
+    },
+    {
+      "requirement": "D4-T10: phase_implement prompt changes to 'make these tests pass' when intent map exists",
+      "source": "D4 Tests item 10",
+      "severity": "high",
+      "reason": "The conditional at phase_implement line 2633 checks TDD_ENABLED + intent_map. No test verifies the TDD prompt branch is taken. This is a core TDD behaviour change."
+    },
+    {
+      "requirement": "D4-T11: phase_implement uses existing prompt when TDD_ENABLED=false or no intent map",
+      "source": "D4 Tests item 11",
+      "severity": "high",
+      "reason": "The else branch at line 2656 uses the original prompt. No test verifies backward compatibility of the implement phase."
+    },
+    {
+      "requirement": "D4-T12: Intent map parse failure degrades gracefully (tests written, no structured map, warning logged)",
+      "source": "D4 Tests item 12",
+      "severity": "medium",
+      "reason": "Fallback path at line 2534. No test exercises it."
+    },
+    {
+      "requirement": "D4-T13: Test files follow existing testing patterns in the project",
+      "source": "D4 Tests item 13",
+      "severity": "low",
+      "reason": "Quality-of-output check on Claude's response. Cannot be automated."
+    },
+    {
+      "requirement": "D5-T1: phase_pattern_baseline outputs parseable JSON with patterns and existing_deviations arrays",
+      "source": "D5 Tests item 1",
+      "severity": "medium",
+      "reason": "Parsing code at line 2610 uses _extract_json_from_response. Requires live Claude."
+    },
+    {
+      "requirement": "D5-T2: Pattern baseline is saved to both state file and explain dir",
+      "source": "D5 Tests item 2",
+      "severity": "medium",
+      "reason": "Code at lines 2612-2614 saves to both. No test validates dual-save."
+    },
+    {
+      "requirement": "D5-T3: PATTERN_CONFORMANCE=false skips both pattern_baseline phase and conformance review step",
+      "source": "D5 Tests item 3",
+      "severity": "high",
+      "reason": "Guard at phase_pattern_baseline line 2570 and phase_skill_chain line 3313. No test verifies either skip path. Critical backward-compat guarantee."
+    },
+    {
+      "requirement": "D5-T4: Conformance review detects deviations from the baseline",
+      "source": "D5 Tests item 4",
+      "severity": "low",
+      "reason": "Quality-of-output check on Claude's conformance review. Cannot be automated."
+    },
+    {
+      "requirement": "D5-T5: Deviation with verdict 'revert' — Claude actually changes the code to conform",
+      "source": "D5 Tests item 5",
+      "severity": "low",
+      "reason": "Claude behaviour during conformance review. Cannot be unit-tested."
+    },
+    {
+      "requirement": "D5-T6: Deviation with verdict 'keep' — Claude adds a PATTERN-DEVIATION comment at the site",
+      "source": "D5 Tests item 6",
+      "severity": "low",
+      "reason": "Claude behaviour during conformance review. Cannot be unit-tested."
+    },
+    {
+      "requirement": "D5-T7: Existing PATTERN-DEVIATION comments are not re-litigated",
+      "source": "D5 Tests item 7",
+      "severity": "low",
+      "reason": "Prompt instruction. Cannot be unit-tested."
+    },
+    {
+      "requirement": "D5-T8: Existing PATTERN-DEVIATION comment IS re-litigated if surrounding code changed significantly",
+      "source": "D5 Tests item 8",
+      "severity": "low",
+      "reason": "Prompt instruction. Cannot be unit-tested."
+    },
+    {
+      "requirement": "D5-T9: Conformance findings are extracted into state file with deviations and conforms lists",
+      "source": "D5 Tests item 9",
+      "severity": "medium",
+      "reason": "_extract_conformance_findings at line 1531 parses and saves. Requires live Claude output to exercise."
+    },
+    {
+      "requirement": "D5-T10: Console log shows per-pattern conformance status (checkmarks and crosses)",
+      "source": "D5 Tests item 10",
+      "severity": "low",
+      "reason": "Log output formatting in _extract_conformance_findings. No test captures console output."
+    },
+    {
+      "requirement": "D5-T13: Pattern baseline parse failure degrades gracefully (no conformance review, warning logged)",
+      "source": "D5 Tests item 13",
+      "severity": "medium",
+      "reason": "Fallback path at phase_pattern_baseline line 2617. No test exercises it."
+    },
+    {
+      "requirement": "D5-T14: Conformance review parse failure degrades gracefully (findings not saved, warning, pipeline continues)",
+      "source": "D5 Tests item 14",
+      "severity": "medium",
+      "reason": "_extract_conformance_findings fallback at line 1555. No test exercises it."
+    },
+    {
+      "requirement": "D5-T15: _extract_skill_chain_findings includes pattern_conformance in its output schema",
+      "source": "D5 Tests item 15",
+      "severity": "medium",
+      "reason": "The schema update exists at line 1173. No test validates the prompt includes the new field."
+    },
+    {
+      "requirement": "D5-T16: Conformance step runs AFTER coding review and BEFORE security review in skill_chain",
+      "source": "D5 Tests item 16",
+      "severity": "high",
+      "reason": "The insertion is at line 3313 between coding review and security review. Verified by code inspection but no test validates the ordering. A misordering would cause conformance to run on un-reviewed code or miss review changes."
+    }
+  ],
+  "implicit_scenarios": [
+    {
+      "scenario": "PHASES array has exactly 13 entries in the correct order",
+      "description": "The PHASES array was changed from 11 to 13 entries. No test explicitly validates the array contents match the spec's expected order: plan decisions test_intent pattern_baseline implement test_fix ci_checks impact skill_chain loc_enforcement fresh_review doc_update final.",
+      "severity": "high"
+    },
+    {
+      "scenario": "phase_test_intent and phase_pattern_baseline are in the authoring block (before SEAM_AFTER)",
+      "description": "The spec requires test_intent and pattern_baseline to use run_claude (--continue) because they're before SEAM_AFTER=ci_checks. No test verifies the phases are before the seam. If someone reorders PHASES, these phases would get fresh sessions instead of continuing the authoring conversation.",
+      "severity": "medium"
+    },
+    {
+      "scenario": "_record_approach fallback entry has correct schema (iteration, summary, error_class, files_touched)",
+      "description": "When _extract_json_from_response fails, _record_approach writes a fallback entry. No test validates the fallback entry's schema matches what _format_approach_journal expects to read.",
+      "severity": "high"
+    },
+    {
+      "scenario": "Tiered escalation loop still calls _run_all_suites at iteration start (not just run_claude)",
+      "description": "The tiered loop must re-run tests at the top of each iteration to check if previous fixes worked. The flat loop does this. No test verifies the tiered loop preserves this pattern.",
+      "severity": "medium"
+    },
+    {
+      "scenario": "Multiple runs in ownership manifest — each run's must_not_touch is the union of OTHER runs' owns",
+      "description": "The manifest correctness depends on Claude assigning must_not_touch correctly. No test creates a manifest with 2+ runs and validates cross-run fencing.",
+      "severity": "medium"
+    },
+    {
+      "scenario": "Boundary fence hook does not block --no-verify commits (cherry-pick compatibility)",
+      "description": "The spec says 'Boundary fence pre-commit hook must not interfere with auto_claude's --no-verify usage'. Cherry-pick in worktree_auto_claude uses --no-verify. No test validates that git commit --no-verify bypasses the fence hook.",
+      "severity": "medium"
+    },
+    {
+      "scenario": "Ownership context in phase_implement includes file lists from _build_ownership_context when both TDD and ownership are active simultaneously",
+      "description": "When TDD_ENABLED=true AND ownership is loaded, phase_implement should include both the intent map AND ownership boundaries. No test validates this combination.",
+      "severity": "medium"
+    },
+    {
+      "scenario": "_build_context_pack for skill_chain includes approach journal even when escalation was not triggered",
+      "description": "Approach journal entries are created in tier 1 (tactical fix). The skill_chain context pack should include these even if escalation never reached tier 2+. Test 6 validates journal in skill_chain pack but doesn't confirm this works when escalation.tier_reached remains 0.",
+      "severity": "low"
+    },
+    {
+      "scenario": "State file corruption recovery — _jq_update failure during approach journal append",
+      "description": "If _jq_update fails mid-append (e.g. disk full, invalid JSON in entry), the state file could become corrupted. _jq_update uses atomic tmp+mv but the entry JSON from Claude could contain characters that break the jq filter.",
+      "severity": "low"
+    },
+    {
+      "scenario": "phase_test_intent called when no test suites are configured",
+      "description": "If no test_suite_* functions exist, _run_all_suites returns 0 (no suites = pass). Red-phase verification would see all pass and warn about vacuous tests. This is correct but unexpected — no test validates this edge case.",
+      "severity": "low"
+    },
+    {
+      "scenario": "Concurrent ownership manifest generation and worktree creation race condition",
+      "description": "Manifest generation is called once before worktrees fork, but if _generate_ownership_manifest is slow (Claude latency), worktrees could be created before the manifest exists. The code handles this by running manifest generation before worktree setup in run_parallel_group.",
+      "severity": "low"
+    },
+    {
+      "scenario": "_build_reanchor_prompt with very large spec file exceeding prompt limits",
+      "description": "Tier 2 re-anchoring injects the full spec content. For very large specs, this could exceed Claude's input limit. No truncation is applied to the spec, unlike test output which is truncated to 400 lines.",
+      "severity": "low"
+    }
+  ]
+}
