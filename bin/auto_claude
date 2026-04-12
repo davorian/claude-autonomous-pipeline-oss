@@ -53,7 +53,24 @@ MAX_REFACTOR_ROUNDS=10
 MAX_LOC=300
 MAX_CI_ITERATIONS=3
 SUITE_IDLE_TIMEOUT=120  # seconds of no new output before killing a suite; 0 = no timeout
-PHASES=(plan decisions implement test_fix ci_checks impact skill_chain loc_enforcement fresh_review doc_update final)
+PHASES=(plan decisions test_intent pattern_baseline implement test_fix ci_checks impact skill_chain loc_enforcement fresh_review doc_update final)
+
+# Tiered escalation thresholds. Each value is the iteration where a new tier begins.
+# Tier 1 (tactical):  iterations 1 to TIER_2_AT-1
+# Tier 2 (re-anchor): iterations TIER_2_AT to TIER_3_AT-1
+# Tier 3 (consult):   iteration TIER_3_AT (generates alternatives)
+# Tier 4 (human):     iteration TIER_4_AT (presents alternatives, pauses)
+TIER_2_AT=3
+TIER_3_AT=4
+TIER_4_AT=5
+ESCALATION_ENABLED=true  # Set false to use flat loop (backward compat)
+
+# TDD — write tests before implementation
+TDD_LAYERS="unit,integration"  # test layers to write: unit,integration,component,e2e
+TDD_ENABLED=true               # set false to skip test_intent and use old behaviour
+
+# Pattern conformance — derive patterns from adjacent code and check implementation
+PATTERN_CONFORMANCE=true  # set false to skip pattern baseline + conformance review
 
 # The last phase in the authoring block. Extraction happens after this phase
 # and all subsequent phases get fresh sessions with structured context packs.
@@ -283,20 +300,37 @@ _ensure_explain_dir() {
   mkdir -p "$EXPLAIN_DIR"
 }
 
-# Parse JSON from LAST_RESPONSE_TEXT. Tries raw parse first, then markdown fence extraction.
+# Parse JSON from LAST_RESPONSE_TEXT. Three-tier extraction:
+#   1. Raw parse — response is pure JSON
+#   2. Markdown fence — JSON wrapped in ```json ... ```
+#   3. Brace extraction — JSON embedded in prose (e.g. "Here's the manifest:\n{...}")
 # Echoes the parsed JSON on success, empty string on failure.
 _extract_json_from_response() {
   local parsed=""
+  # Tier 1: raw JSON
   if parsed=$(echo "$LAST_RESPONSE_TEXT" | jq '.' 2>/dev/null); then
     echo "$parsed"
     return 0
   fi
 
+  # Tier 2: markdown fence extraction
   local extracted
   extracted=$(echo "$LAST_RESPONSE_TEXT" | sed -n '/^```\(json\)\{0,1\}$/,/^```$/p' | sed '1d;$d')
   if [ -n "$extracted" ] && parsed=$(echo "$extracted" | jq '.' 2>/dev/null); then
     echo "$parsed"
     return 0
+  fi
+
+  # Tier 3: find first { and last } — handles prose before/after JSON
+  local first_brace last_brace
+  first_brace=$(echo "$LAST_RESPONSE_TEXT" | grep -n '{' | head -1 | cut -d: -f1)
+  last_brace=$(echo "$LAST_RESPONSE_TEXT" | grep -n '}' | tail -1 | cut -d: -f1)
+  if [ -n "$first_brace" ] && [ -n "$last_brace" ] && [ "$first_brace" -le "$last_brace" ]; then
+    extracted=$(echo "$LAST_RESPONSE_TEXT" | sed -n "${first_brace},${last_brace}p")
+    if [ -n "$extracted" ] && parsed=$(echo "$extracted" | jq '.' 2>/dev/null); then
+      echo "$parsed"
+      return 0
+    fi
   fi
 
   echo ""
@@ -463,7 +497,15 @@ _init_state() {
           iterations_needed: 0,
           auto_fixed: [],
           claude_fixed: []
-        }
+        },
+        approach_journal: [],
+        escalation: {
+          alternatives: [],
+          diagnosis: null,
+          chosen: null,
+          tier_reached: 0
+        },
+        tdd_status: null
       },
       semantic: {
         plan_intent: null,
@@ -476,7 +518,11 @@ _init_state() {
         skill_chain_findings: null,
         review_findings: null,
         doc_update_summary: null,
-        test_audit: null
+        test_audit: null,
+        intent_map: null,
+        decisions_manifest: null,
+        pattern_baseline: null,
+        conformance_findings: null
       }
     }' > "$STATE_FILE"
 
@@ -559,6 +605,61 @@ _update_test_results() {
 
   _jq_update --arg s "$final_status" --argjson i "$iterations" --argjson suites "$suites_json" \
     '.deterministic.test_results = {final_status: $s, iterations_needed: $i, suites: $suites}'
+}
+
+# Record what was tried in a test_fix iteration. Called after each fix attempt
+# via run_claude. Appends a structured entry to the approach journal in state.
+_record_approach() {
+  local iteration="$1"
+
+  run_claude "Summarise in ONE sentence what you just changed to fix the test failures,
+and in ONE sentence what error pattern you were addressing.
+Output ONLY valid JSON (no markdown fences, no commentary):
+{\"summary\": \"...\", \"error_class\": \"...\", \"files_touched\": [\"file1.ts\", \"file2.ts\"]}"
+
+  local parsed=""
+  if parsed=$(_extract_json_from_response); then
+    if [ -n "$parsed" ]; then
+      _jq_update --argjson entry "$parsed" --argjson i "$iteration" \
+        '.deterministic.approach_journal += [($entry + {iteration: $i})]'
+      log OK "Approach journal: iteration ${iteration} recorded"
+      return 0
+    fi
+  fi
+
+  # Fallback: record that extraction failed so the journal still tracks the iteration
+  log WARN "Could not parse approach summary for iteration ${iteration} — recording fallback"
+  _jq_update --argjson i "$iteration" \
+    '.deterministic.approach_journal += [{iteration: $i, summary: "(extraction failed)", error_class: "unknown", files_touched: []}]'
+}
+
+# Format the approach journal for injection into test_fix prompts.
+# Returns formatted string, or empty string if no entries.
+_format_approach_journal() {
+  local journal
+  journal=$(jq -r '
+    (.deterministic.approach_journal // []) |
+    if length == 0 then ""
+    else
+      "PREVIOUS ATTEMPTS (do NOT repeat these — they all failed):\n" +
+      ([ .[] |
+        "- Iteration " + (.iteration | tostring) + ": " + .summary +
+        " [error: " + .error_class + "]" +
+        " [files: " + (.files_touched | join(", ")) + "]"
+      ] | join("\n"))
+    end
+  ' "$STATE_FILE" 2>/dev/null) || true
+
+  echo "$journal"
+}
+
+# Determine escalation tier for a given test_fix iteration.
+_tier_for_iteration() {
+  local iteration="$1"
+  if [ "$iteration" -lt "$TIER_2_AT" ]; then echo 1
+  elif [ "$iteration" -lt "$TIER_3_AT" ]; then echo 2
+  elif [ "$iteration" -lt "$TIER_4_AT" ]; then echo 3
+  else echo 4; fi
 }
 
 # ─── Claude Invocation ───────────────────────────────────────────────────────
@@ -1064,6 +1165,341 @@ Output ONLY valid JSON (no markdown fences, no commentary). Use these exact fiel
   log WARN "Could not parse doc update summary"
 }
 
+# ─── Escalation Prompt Builders ─────────────────────────────────────────────
+#
+# Used by the tiered escalation loop in phase_test_fix when ESCALATION_ENABLED=true.
+
+# Tier 2: Re-anchor with spec intent, decisions, approach journal, and intent map.
+_build_reanchor_prompt() {
+  local truncated_output="$1"
+
+  local spec_content=""
+  [ -f "$SPEC_FILE" ] && spec_content="$(cat "$SPEC_FILE")"
+
+  local decisions=""
+  decisions=$(_state_get '.semantic.decisions_manifest // empty')
+  if [ -n "$decisions" ]; then
+    decisions=$(echo "$decisions" | jq -r '
+      [ (.deliverables // [])[] |
+        .title + ":\n" +
+        ([ (.decisions // [])[] | "  - " + .choice + " (" + .rationale + ")" ] | join("\n"))
+      ] | join("\n\n")
+    ' 2>/dev/null) || decisions=""
+  fi
+
+  local journal=""
+  journal=$(_format_approach_journal)
+
+  # Intent map section (from D4 — graceful if absent)
+  local intent_section=""
+  local intent_map
+  intent_map=$(_state_get '.semantic.intent_map // empty')
+  if [ -n "$intent_map" ] && [ "$intent_map" != "null" ]; then
+    intent_section=$(echo "$intent_map" | jq -r '
+      "INTENT MAP: These tests encode the acceptance criteria:\n" +
+      ([ .[] |
+        ([ (.intents // [])[] |
+          "- [" + (.layer // "?") + "] " + .test_name + ": " + .expected_behaviour
+        ] | join("\n"))
+      ] | join("\n"))
+    ' 2>/dev/null) || intent_section=""
+  fi
+
+  local iteration_count=$((TIER_2_AT - 1))
+
+  echo "IMPORTANT: You have failed to fix these tests ${iteration_count} times.
+Before attempting another fix, re-read the original intent and your decisions.
+
+ORIGINAL SPEC:
+${spec_content}
+
+YOUR DECISIONS:
+${decisions:-"(not available)"}
+
+${journal}
+
+${intent_section}
+
+CURRENT FAILURES:
+Failed suites: ${LAST_FAILED_SUITES}
+Passed suites: ${LAST_PASSED_SUITES}
+
+\`\`\`
+${truncated_output}
+\`\`\`
+
+Re-evaluate: is your current approach sound, or is there a design-level issue
+that tactical fixes cannot resolve? If the approach is wrong, describe what needs
+to change fundamentally before attempting the fix. Then fix the code."
+}
+
+# Tier 3: Self-contained prompt for a fresh consultation session.
+_build_consultation_prompt() {
+  local truncated_output="$1"
+
+  local spec_intent
+  spec_intent=$(_state_get '.semantic.plan_intent // "(not extracted)"')
+
+  local journal=""
+  journal=$(_format_approach_journal)
+
+  local changed_files=""
+  changed_files=$(_state_get '[ (.deterministic.files_changed // [])[] ] | join(", ")')
+
+  # Intent map for intent-vs-reality section
+  local intent_vs_reality=""
+  local intent_map
+  intent_map=$(_state_get '.semantic.intent_map // empty')
+  if [ -n "$intent_map" ] && [ "$intent_map" != "null" ]; then
+    intent_vs_reality=$(echo "$intent_map" | jq -r --arg failed "$LAST_FAILED_SUITES" '
+      "INTENT vs REALITY:\n" +
+      ([ .[] | .intents[]? |
+        "- INTENT: \"" + .test_name + "\"\n  EXPECTED: " + .expected_behaviour + "\n  STATUS: " +
+        (if ($failed | contains(.test_name)) then "FAILING" else "UNKNOWN" end)
+      ] | join("\n"))
+    ' 2>/dev/null) || intent_vs_reality=""
+  fi
+
+  # File tree (limited to 300 entries)
+  local file_tree=""
+  file_tree=$(find "$PROJECT_ROOT" \( -name '*.ts' -o -name '*.tsx' -o -name '*.py' -o -name '*.ex' -o -name '*.exs' -o -name '*.go' -o -name '*.rs' \) -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null | head -300)
+
+  echo "You are an architectural consultant reviewing a stuck implementation.
+
+GOAL: ${spec_intent}
+
+FILES CHANGED: ${changed_files}
+
+${journal}
+
+${intent_vs_reality}
+
+PROJECT FILE TREE (sample):
+${file_tree}
+
+CURRENT TEST FAILURES:
+Failed suites: ${LAST_FAILED_SUITES}
+
+\`\`\`
+${truncated_output}
+\`\`\`
+
+Diagnose why the current approach is failing and propose 2-3 alternative approaches.
+Output ONLY valid JSON (no markdown fences, no commentary):
+{
+  \"diagnosis\": \"1-3 sentences on why the current approach is failing\",
+  \"alternatives\": [
+    {
+      \"id\": \"A\",
+      \"summary\": \"One-line description\",
+      \"approach\": \"2-3 sentences on what would change architecturally\",
+      \"why_it_might_work\": \"Why this avoids the root cause\",
+      \"files_affected\": [\"file1.ts\"],
+      \"risk\": \"What could go wrong\",
+      \"confidence\": \"high|medium|low\"
+    }
+  ]
+}"
+}
+
+# Build structured intent-vs-reality gap analysis for the human checkpoint.
+_build_intent_gap_analysis() {
+  local intent_map
+  intent_map=$(_state_get '.semantic.intent_map // empty')
+
+  if [ -n "$intent_map" ] && [ "$intent_map" != "null" ]; then
+    echo "$intent_map" | jq -r --arg failed "$LAST_FAILED_SUITES" '
+      "Intent Gap Analysis:\n" +
+      ([ .[] | .intents[]? |
+        (if ($failed | contains(.test_name)) then
+          "  FAILING: " + .test_name + "\n    Expected: " + .expected_behaviour
+        else empty end)
+      ] | if length == 0 then "  (no intent map entries match failing suites)"
+          else join("\n") end)
+    ' 2>/dev/null || echo "Intent Gap Analysis: (could not parse intent map)"
+  else
+    echo "Intent Gap Analysis: (no structured intent map available)
+  Failing suites: ${LAST_FAILED_SUITES}"
+  fi
+}
+
+# Tier 4: Present alternatives to the human, read their choice.
+_present_alternatives() {
+  local truncated_output="$1"
+
+  local gap_analysis
+  gap_analysis=$(_build_intent_gap_analysis)
+
+  local diagnosis
+  diagnosis=$(_state_get '.deterministic.escalation.diagnosis // "(no diagnosis)"')
+
+  local journal=""
+  journal=$(_format_approach_journal)
+
+  local alternatives_display
+  alternatives_display=$(jq -r '
+    [ (.deterministic.escalation.alternatives // [])[] |
+      "  " + .id + ") " + .summary + " (confidence: " + .confidence + ", files: " + (.files_affected | length | tostring) + ")\n" +
+      "     " + .approach
+    ] | join("\n\n")
+  ' "$STATE_FILE" 2>/dev/null) || alternatives_display="(no alternatives available)"
+
+  # Print to terminal (stderr so it shows even when stdout is captured)
+  cat >&2 <<EOF
+
+══════════════════════════════════════════════════════════════
+TEST-FIX ESCALATION: Implementation stuck after $((TIER_4_AT - 1)) iterations.
+
+${gap_analysis}
+
+Diagnosis: ${diagnosis}
+
+What was tried:
+${journal:-"(no approach journal)"}
+
+Alternatives:
+${alternatives_display}
+
+Enter A/B/C to try an alternative, R to retry current approach,
+or Q to abort pipeline:
+══════════════════════════════════════════════════════════════
+EOF
+
+  local choice=""
+  read -r choice
+  echo "$choice"
+}
+
+# Resume implementation with a chosen alternative approach.
+_resume_with_alternative() {
+  local alt_json="$1"
+  local truncated_output="$2"
+
+  local alt_id alt_summary alt_approach alt_files
+  alt_id=$(echo "$alt_json" | jq -r '.id // "?"')
+  alt_summary=$(echo "$alt_json" | jq -r '.summary // ""')
+  alt_approach=$(echo "$alt_json" | jq -r '.approach // ""')
+  alt_files=$(echo "$alt_json" | jq -r '[ .files_affected // [] | .[] ] | join(", ")')
+
+  # Record the choice in state
+  _jq_update --arg id "$alt_id" '.deterministic.escalation.chosen = $id'
+
+  run_claude "CHANGE OF APPROACH. The previous approach failed repeatedly.
+
+NEW APPROACH (${alt_id}): ${alt_summary}
+${alt_approach}
+
+FILES TO CHANGE: ${alt_files}
+
+CURRENT FAILURES:
+Failed suites: ${LAST_FAILED_SUITES}
+Passed suites: ${LAST_PASSED_SUITES}
+
+\`\`\`
+${truncated_output}
+\`\`\`
+
+Re-implement the failing section using this new approach.
+Do NOT continue with the old approach.
+Make the failing tests pass."
+}
+
+# ─── Pattern Conformance ────────────────────────────────────────────────────
+#
+# Called within phase_skill_chain to check implementation against derived patterns.
+
+_run_pattern_conformance() {
+  local baseline
+  baseline=$(_state_get '.semantic.pattern_baseline // empty')
+  if [ -z "$baseline" ] || [ "$baseline" = "null" ]; then
+    log INFO "No pattern baseline — skipping conformance review"
+    return 0
+  fi
+
+  local existing_deviations
+  existing_deviations=$(_state_get '[ (.semantic.pattern_baseline.existing_deviations // [])[] | "- " + .file + ":" + (.line | tostring) + ": " + .comment ] | join("\n")')
+
+  run_claude "IMPORTANT: Tests have already passed. Do NOT re-run tests.
+
+Review all changed files for PATTERN CONFORMANCE against this baseline:
+
+${baseline}
+
+Previously accepted deviations (do NOT re-litigate these unless the
+surrounding code has changed enough to invalidate the rationale):
+${existing_deviations:-"(none)"}
+
+For each pattern in the baseline, check whether your implementation conforms.
+For each DEVIATION you find:
+1. State what the existing pattern is and what you did differently
+2. List PROS of the new approach (be honest — real benefits only)
+3. List CONS of the new approach (focus on consistency cost, maintenance burden,
+   reader confusion, contract violations)
+4. Verdict: if cons outweigh pros → REVERT to existing pattern and make the change.
+   If pros outweigh → KEEP but add a PATTERN-DEVIATION comment at the deviation site.
+
+The bar for keeping a deviation is: \"this is meaningfully better AND the existing
+pattern cannot accommodate the requirement.\" Pattern consistency has inherent value
+that must be overcome.
+
+After reviewing and acting on all deviations, output a JSON summary.
+Output ONLY valid JSON (no markdown fences, no commentary):
+{
+  \"deviations\": [
+    {
+      \"id\": \"DEV-001\",
+      \"pattern_id\": \"P001\",
+      \"area\": \"description\",
+      \"existing_pattern\": \"what the codebase does\",
+      \"implementation_pattern\": \"what was implemented\",
+      \"pros\": [\"...\"],
+      \"cons\": [\"...\"],
+      \"verdict\": \"revert|keep\",
+      \"rationale\": \"1-2 sentences on why this verdict\",
+      \"action_taken\": \"what was changed (if revert) or comment added (if keep)\"
+    }
+  ],
+  \"conforms\": [\"P002\", \"P003\"]
+}"
+}
+
+_extract_conformance_findings() {
+  log INFO "Extracting conformance findings..."
+
+  local parsed=""
+  if parsed=$(echo "$LAST_RESPONSE_TEXT" | jq '.' 2>/dev/null); then
+    _jq_update --argjson c "$parsed" '.semantic.conformance_findings = $c'
+    _ensure_explain_dir
+    echo "$parsed" > "$EXPLAIN_DIR/conformance_findings.json"
+    log OK "Conformance findings saved to state"
+
+    # Log per-pattern summary
+    local summary
+    summary=$(echo "$parsed" | jq -r '
+      ([ (.conforms // [])[] | "  ✓ " + . + ": conforms" ] | join("\n")) +
+      "\n" +
+      ([ (.deviations // [])[] |
+        "  ✗ " + .area + ": DEVIATION → verdict: " + .verdict +
+        (if .verdict == "revert" then " → reverted" else " (documented)" end)
+      ] | join("\n"))
+    ' 2>/dev/null) || summary=""
+    [ -n "$summary" ] && log INFO "Pattern conformance:\n${summary}"
+    return 0
+  fi
+
+  local extracted
+  extracted=$(echo "$LAST_RESPONSE_TEXT" | sed -n '/^```\(json\)\{0,1\}$/,/^```$/p' | sed '1d;$d')
+  if [ -n "$extracted" ] && parsed=$(echo "$extracted" | jq '.' 2>/dev/null); then
+    _jq_update --argjson c "$parsed" '.semantic.conformance_findings = $c'
+    _ensure_explain_dir
+    echo "$parsed" > "$EXPLAIN_DIR/conformance_findings.json"
+    log OK "Conformance findings saved to state (from markdown fence)"
+    return 0
+  fi
+
+  log WARN "Could not parse conformance findings"
+}
+
 # ─── Context Pack Builder ────────────────────────────────────────────────────
 #
 # Assembles a tailored markdown prompt from the state file for each quality phase.
@@ -1090,6 +1526,11 @@ _build_context_pack() {
         "**Test status:** " + (.deterministic.test_results.final_status // "unknown") +
           " after " + ((.deterministic.test_results.iterations_needed // 0) | tostring) + " iteration(s).\n" +
         (.semantic.test_fix_summary // "") + "\n\n" +
+        "**Approach journal:**\n" +
+          ([ (.deterministic.approach_journal // [])[] |
+             "- Iteration " + (.iteration | tostring) + ": " + .summary +
+             " [error: " + .error_class + "]" ]
+           | if length == 0 then "(no iterations needed)" else join("\n") end) + "\n\n" +
         "**CI checks:** " + (.deterministic.ci_checks_results.final_status // "pending") +
           " (auto-fixed: " +
           ([ (.deterministic.ci_checks_results.auto_fixed // [])[] ] | if length == 0 then "none" else join(", ") end) +
@@ -1156,6 +1597,25 @@ _build_context_pack() {
             echo '```'
           fi
         fi
+
+        # Inject pattern deviation findings for the cold reviewer to challenge
+        if [ -f "$EXPLAIN_DIR/conformance_findings.json" ]; then
+          local deviations_display
+          deviations_display=$(jq -r '
+            ([ (.deviations // [])[] |
+              (if .verdict == "revert" then
+                "- [REVERTED] " + .area + ": " + .action_taken
+              else
+                "- [KEPT] " + .area + ": " + .rationale + ". Challenge this if you disagree."
+              end)
+            ] | if length == 0 then "" else join("\n") end)
+          ' "$EXPLAIN_DIR/conformance_findings.json" 2>/dev/null) || deviations_display=""
+          if [ -n "$deviations_display" ]; then
+            echo ""
+            echo "**Pattern Deviations:**"
+            echo "$deviations_display"
+          fi
+        fi
       }
       ;;
 
@@ -1190,6 +1650,17 @@ _build_context_pack() {
         "**Test results:** " + (.deterministic.test_results.final_status // "unknown") +
           " after " + ((.deterministic.test_results.iterations_needed // 0) | tostring) + " iteration(s).\n" +
         (.semantic.test_fix_summary // "") + "\n\n" +
+        "**Approach journal:**\n" +
+          ([ (.deterministic.approach_journal // [])[] |
+             "- Iteration " + (.iteration | tostring) + ": " + .summary +
+             " [error: " + .error_class + "]" ]
+           | if length == 0 then "(no iterations needed)" else join("\n") end) + "\n\n" +
+        "**Escalation:** " +
+          (if ((.deterministic.escalation.tier_reached // 0) > 1) then
+            "Reached tier " + ((.deterministic.escalation.tier_reached) | tostring) + ". " +
+            "Diagnosis: " + (.deterministic.escalation.diagnosis // "(none)") + ". " +
+            "Chosen alternative: " + (.deterministic.escalation.chosen // "none")
+          else "No escalation needed" end) + "\n\n" +
         "**CI checks:** " + (.deterministic.ci_checks_results.final_status // "pending") +
           " (auto-fixed: " +
           ([ (.deterministic.ci_checks_results.auto_fixed // [])[] ] | if length == 0 then "none" else join(", ") end) +
@@ -1209,6 +1680,13 @@ _build_context_pack() {
               ([ (.semantic.skill_chain_findings.simplifications // [])[] | "- " + . ] | join("\n")) + "\n" +
             "Verified clean:\n" +
               ([ (.semantic.skill_chain_findings.verified_clean // [])[] | "- " + . ] | join("\n"))
+          else "(not captured)" end) + "\n\n" +
+        "**Pattern conformance:**\n" +
+          (if (.semantic.conformance_findings | type) == "object" then
+            "Reverted:\n" +
+              ([ (.semantic.conformance_findings.deviations // [])[] | select(.verdict == "revert") | "- " + .area + ": " + .action_taken ] | if length == 0 then "(none)\n" else join("\n") + "\n" end) +
+            "Kept (with PATTERN-DEVIATION comment):\n" +
+              ([ (.semantic.conformance_findings.deviations // [])[] | select(.verdict == "keep") | "- " + .area + ": " + .rationale ] | if length == 0 then "(none)" else join("\n") end)
           else "(not captured)" end) + "\n\n" +
         "**Fresh review findings:**\n" +
           (if (.semantic.review_findings | type) == "object" then
@@ -2006,11 +2484,59 @@ phase_test_fix() {
   # ── Main test-fix loop (only for code failures) ──────────────────────
   local iteration=0
 
+  if [ "${ESCALATION_ENABLED}" != "true" ]; then
+    # Flat loop (backward compat — ESCALATION_ENABLED=false)
+    while [ $iteration -lt $MAX_TEST_ITERATIONS ]; do
+      iteration=$((iteration + 1))
+      log INFO "Test iteration ${iteration}/${MAX_TEST_ITERATIONS}"
+
+      if [ $iteration -gt 1 ]; then
+        local test_exit=0
+        _run_all_suites || test_exit=$?
+
+        if [ $test_exit -eq 0 ]; then
+          log OK "All tests pass on iteration ${iteration}"
+          _update_test_results "pass" "$iteration"
+          _extract_coverage_map || true
+          return 0
+        fi
+      fi
+
+      log WARN "Tests failed on iteration ${iteration}, asking Claude to fix..."
+
+      local truncated_output
+      truncated_output=$(echo "$LAST_TEST_OUTPUT" | tail -n 400)
+      if [ "$(echo "$LAST_TEST_OUTPUT" | wc -l)" -gt 400 ]; then
+        truncated_output="[...truncated to last 400 lines...]
+${truncated_output}"
+      fi
+
+      run_claude "Tests are failing. Failed suites: ${LAST_FAILED_SUITES}
+Passed suites: ${LAST_PASSED_SUITES}
+
+Here is the test output:
+
+\`\`\`
+${truncated_output}
+\`\`\`
+
+Fix the failures in the failing suites. Do not change test expectations unless the test itself is wrong.
+Fix the implementation to match the tests."
+    done
+
+    _update_test_results "fail" "$MAX_TEST_ITERATIONS"
+    log ERROR "Tests still failing after ${MAX_TEST_ITERATIONS} iterations"
+    return 1
+  fi
+
+  # Tiered escalation loop (ESCALATION_ENABLED=true)
   while [ $iteration -lt $MAX_TEST_ITERATIONS ]; do
     iteration=$((iteration + 1))
-    log INFO "Test iteration ${iteration}/${MAX_TEST_ITERATIONS}"
+    local tier
+    tier=$(_tier_for_iteration "$iteration")
+    log INFO "Test iteration ${iteration}/${MAX_TEST_ITERATIONS} (tier ${tier})"
 
-    # First iteration: we already ran suites in pre-flight, don't re-run
+    # Re-run tests (skip on iteration 1 — pre-flight already ran)
     if [ $iteration -gt 1 ]; then
       local test_exit=0
       _run_all_suites || test_exit=$?
@@ -2023,9 +2549,9 @@ phase_test_fix() {
       fi
     fi
 
-    log WARN "Tests failed on iteration ${iteration}, asking Claude to fix..."
+    log WARN "Tests failed on iteration ${iteration}, escalation tier ${tier}..."
 
-    # Truncate to last 400 lines to stay within prompt limits
+    # Truncate test output (shared across all tiers)
     local truncated_output
     truncated_output=$(echo "$LAST_TEST_OUTPUT" | tail -n 400)
     if [ "$(echo "$LAST_TEST_OUTPUT" | wc -l)" -gt 400 ]; then
@@ -2033,7 +2559,15 @@ phase_test_fix() {
 ${truncated_output}"
     fi
 
-    run_claude "Tests are failing. Failed suites: ${LAST_FAILED_SUITES}
+    case "$tier" in
+      1)
+        # Tier 1: Tactical fix (current behavior + approach journal)
+        local journal=""
+        journal=$(_format_approach_journal)
+
+        run_claude "${journal:+${journal}
+
+}Tests are failing. Failed suites: ${LAST_FAILED_SUITES}
 Passed suites: ${LAST_PASSED_SUITES}
 
 Here is the test output:
@@ -2044,6 +2578,124 @@ ${truncated_output}
 
 Fix the failures in the failing suites. Do not change test expectations unless the test itself is wrong.
 Fix the implementation to match the tests."
+
+        _record_approach "$iteration"
+        ;;
+
+      2)
+        # Tier 2: Re-anchored fix — re-inject spec + decisions + journal
+        log INFO "Escalating to tier 2: re-anchoring with spec and decisions..."
+        local reanchor_prompt
+        reanchor_prompt=$(_build_reanchor_prompt "$truncated_output")
+        run_claude "$reanchor_prompt"
+        _record_approach "$iteration"
+        ;;
+
+      3)
+        # Tier 3: Architectural consultation — fresh session
+        log INFO "Escalating to tier 3: architectural consultation..."
+        local consult_prompt
+        consult_prompt=$(_build_consultation_prompt "$truncated_output")
+        run_claude_fresh "$consult_prompt"
+
+        # Parse alternatives JSON from fresh session
+        local parsed=""
+        if parsed=$(_extract_json_from_response); then
+          if [ -n "$parsed" ]; then
+            _jq_update --argjson a "$parsed" \
+              '.deterministic.escalation.alternatives = ($a.alternatives // []) | .deterministic.escalation.diagnosis = ($a.diagnosis // null)'
+            _ensure_explain_dir
+            echo "$parsed" > "$EXPLAIN_DIR/alternatives.json"
+            log OK "Consultation produced $(echo "$parsed" | jq '.alternatives | length') alternatives"
+          else
+            log WARN "Tier 3 parse failure — falling back to tactical fix"
+            run_claude "Tests are failing. Failed suites: ${LAST_FAILED_SUITES}
+Here is the test output:
+
+\`\`\`
+${truncated_output}
+\`\`\`
+
+Fix the failures."
+          fi
+        else
+          log WARN "Tier 3 parse failure — falling back to tactical fix"
+          run_claude "Tests are failing. Failed suites: ${LAST_FAILED_SUITES}
+Here is the test output:
+
+\`\`\`
+${truncated_output}
+\`\`\`
+
+Fix the failures."
+        fi
+
+        _record_approach "$iteration"
+        ;;
+
+      4)
+        # Tier 4: Human checkpoint — present alternatives, pause for input
+        log INFO "Escalating to tier 4: human checkpoint..."
+        local choice
+        choice=$(_present_alternatives "$truncated_output")
+
+        case "$choice" in
+          [Aa]|[Bb]|[Cc])
+            local alt_id
+            alt_id=$(echo "$choice" | tr '[:lower:]' '[:upper:]')
+            local alt_json
+            alt_json=$(jq -r --arg id "$alt_id" \
+              '.deterministic.escalation.alternatives[] | select(.id == $id)' \
+              "$STATE_FILE" 2>/dev/null)
+            if [ -n "$alt_json" ]; then
+              _resume_with_alternative "$alt_json" "$truncated_output"
+            else
+              log WARN "Alternative ${alt_id} not found — retrying with tactical fix"
+              run_claude "Tests are failing. Failed suites: ${LAST_FAILED_SUITES}
+Here is the test output:
+\`\`\`
+${truncated_output}
+\`\`\`
+Fix the failures."
+            fi
+            _record_approach "$iteration"
+            ;;
+          [Rr])
+            log INFO "Human chose retry — tactical fix"
+            local journal=""
+            journal=$(_format_approach_journal)
+            run_claude "${journal:+${journal}
+
+}Tests are failing. Failed suites: ${LAST_FAILED_SUITES}
+Passed suites: ${LAST_PASSED_SUITES}
+
+Here is the test output:
+
+\`\`\`
+${truncated_output}
+\`\`\`
+
+Fix the failures in the failing suites. Do not change test expectations unless the test itself is wrong.
+Fix the implementation to match the tests."
+            _record_approach "$iteration"
+            ;;
+          [Qq])
+            log WARN "Human chose to abort pipeline"
+            _update_test_results "escalation_abort" "$iteration"
+            return 1
+            ;;
+          *)
+            log WARN "Unrecognised choice '${choice}' — treating as abort"
+            _update_test_results "escalation_abort" "$iteration"
+            return 1
+            ;;
+        esac
+        ;;
+    esac
+
+    # Track highest tier reached
+    _jq_update --argjson t "$tier" \
+      '.deterministic.escalation.tier_reached = ([$t, (.deterministic.escalation.tier_reached // 0)] | max)'
   done
 
   _update_test_results "fail" "$MAX_TEST_ITERATIONS"
