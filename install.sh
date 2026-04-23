@@ -2,29 +2,47 @@
 # ac-helper installer — downloads the right prebuilt binary for your OS/arch
 # from the latest GitHub Release and drops it into $PREFIX/bin/ac-helper.
 #
+# The repo is private, so this uses `gh release download` (authenticated)
+# rather than anonymous curl. Install `gh` and run `gh auth login` first.
+#
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/davorian/claude-autonomous-pipeline/main/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/davorian/claude-autonomous-pipeline/main/install.sh | PREFIX=/usr/local sh
-#   curl -fsSL https://raw.githubusercontent.com/davorian/claude-autonomous-pipeline/main/install.sh | VERSION=v0.1.0 sh
+#   ./install.sh
+#   PREFIX=/usr/local ./install.sh
+#   VERSION=v0.1.0 ./install.sh
+#
+# Or, pulled from the private repo in one shot:
+#   gh api /repos/davorian/claude-autonomous-pipeline/contents/install.sh \
+#     --jq .content | base64 -d | sh
 #
 # Environment:
 #   PREFIX   install root (default: $HOME) — binary lands in $PREFIX/bin/ac-helper
 #   VERSION  release tag to pin (default: latest)
 #
-# POSIX sh — runs on any Mac/Linux with curl.
+# POSIX sh — runs on any Mac/Linux with `gh` installed and authenticated.
 
 set -eu
 
 REPO="davorian/claude-autonomous-pipeline"
 BIN_NAME="ac-helper"
 PREFIX="${PREFIX:-$HOME}"
-VERSION="${VERSION:-latest}"
+VERSION="${VERSION:-}"
 
 BINDIR="$PREFIX/bin"
 TARGET="$BINDIR/$BIN_NAME"
 
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 info() { printf '→ %s\n' "$*"; }
+
+# --- Prereq: gh CLI + auth ----------------------------------------------------
+if ! command -v gh >/dev/null 2>&1; then
+  die "\`gh\` is not installed. Install it first:
+    macOS:  brew install gh
+    Linux:  see https://github.com/cli/cli#installation"
+fi
+
+if ! gh auth status >/dev/null 2>&1; then
+  die "\`gh\` is not authenticated. Run \`gh auth login\` first."
+fi
 
 # --- OS / arch detection ------------------------------------------------------
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -42,17 +60,9 @@ esac
 
 asset="$BIN_NAME-$os-$arch"
 
-# --- URL resolution -----------------------------------------------------------
-if [ "$VERSION" = "latest" ]; then
-  url="https://github.com/$REPO/releases/latest/download/$asset"
-else
-  url="https://github.com/$REPO/releases/download/$VERSION/$asset"
-fi
-
-# --- Download -----------------------------------------------------------------
+# --- Download via gh ----------------------------------------------------------
 info "platform: $os/$arch"
-info "version:  $VERSION"
-info "source:   $url"
+info "version:  ${VERSION:-latest}"
 info "target:   $TARGET"
 
 mkdir -p "$BINDIR"
@@ -60,14 +70,21 @@ mkdir -p "$BINDIR"
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 
-if ! curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$tmp"; then
-  die "download failed — check that release $VERSION exists and asset $asset is attached"
+dl_args="--repo $REPO --pattern $asset --output $tmp --clobber"
+# If VERSION is set, pass it as a positional tag; otherwise gh resolves
+# the latest release automatically.
+if [ -n "$VERSION" ]; then
+  # shellcheck disable=SC2086
+  gh release download "$VERSION" $dl_args || die "download failed — check that $VERSION exists on $REPO"
+else
+  # shellcheck disable=SC2086
+  gh release download $dl_args || die "download failed — no release on $REPO?"
 fi
 
-# Basic sanity: non-empty file, not an HTML 404
+# Basic sanity: non-empty binary
 size=$(wc -c < "$tmp" | tr -d ' ')
 if [ "$size" -lt 100000 ]; then
-  die "downloaded file is only $size bytes — likely a 404/redirect page, not a binary"
+  die "downloaded file is only $size bytes — likely a redirect page, not a binary"
 fi
 
 # --- Install ------------------------------------------------------------------

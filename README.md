@@ -56,31 +56,55 @@ parsing). It kills a class of recurring bash bugs. The bash script works
 without it — it detects the binary on `PATH` and falls back to hardened
 bash if absent — but having it on is strictly better.
 
-### Seamless install (one-liner)
+### Prerequisites
 
-Installs to `~/bin/ac-helper` (change with `PREFIX=/usr/local`, etc.). The
-script detects OS + architecture, downloads the right binary, and strips
-macOS Gatekeeper quarantine automatically.
+This repo is **private**, so the installers below use the GitHub CLI
+(`gh`) for authenticated downloads rather than anonymous `curl`. One-time
+setup:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/davorian/claude-autonomous-pipeline/main/install.sh | sh
+# macOS
+brew install gh
+
+# Linux — see https://github.com/cli/cli#installation
+
+# Then, once:
+gh auth login
 ```
 
-Pin a specific version:
+### Seamless install (one-liner)
+
+Fetches `install.sh` from the private repo via the authenticated `gh`
+token, runs it, auto-detects your OS + arch, and drops the binary at
+`~/bin/ac-helper`. On macOS it also strips Gatekeeper quarantine.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/davorian/claude-autonomous-pipeline/main/install.sh | VERSION=v0.1.0 sh
+gh api /repos/davorian/claude-autonomous-pipeline/contents/install.sh --jq .content | base64 -d | sh
+```
+
+Pin a specific version (same flow):
+
+```sh
+gh api /repos/davorian/claude-autonomous-pipeline/contents/install.sh --jq .content | base64 -d | VERSION=v0.1.0 sh
+```
+
+Change install root:
+
+```sh
+gh api /repos/davorian/claude-autonomous-pipeline/contents/install.sh --jq .content | base64 -d | PREFIX=/usr/local sh
 ```
 
 ### Per-platform manual install
 
-If you'd rather pull the binary yourself. Replace `latest` with a version
-tag (`v0.1.0`) to pin.
+One-liners per machine type if you'd rather skip `install.sh`. Replace
+`latest` resolution is automatic when no tag is specified; add
+`v0.1.0` positionally after `download` to pin.
 
 **macOS — Apple Silicon (M1/M2/M3/M4):**
 
 ```sh
-curl -L https://github.com/davorian/claude-autonomous-pipeline/releases/latest/download/ac-helper-darwin-arm64 -o ~/bin/ac-helper
+gh release download --repo davorian/claude-autonomous-pipeline \
+  --pattern 'ac-helper-darwin-arm64' --output ~/bin/ac-helper --clobber
 chmod +x ~/bin/ac-helper
 xattr -d com.apple.quarantine ~/bin/ac-helper 2>/dev/null || true
 ```
@@ -88,7 +112,8 @@ xattr -d com.apple.quarantine ~/bin/ac-helper 2>/dev/null || true
 **macOS — Intel:**
 
 ```sh
-curl -L https://github.com/davorian/claude-autonomous-pipeline/releases/latest/download/ac-helper-darwin-amd64 -o ~/bin/ac-helper
+gh release download --repo davorian/claude-autonomous-pipeline \
+  --pattern 'ac-helper-darwin-amd64' --output ~/bin/ac-helper --clobber
 chmod +x ~/bin/ac-helper
 xattr -d com.apple.quarantine ~/bin/ac-helper 2>/dev/null || true
 ```
@@ -96,14 +121,16 @@ xattr -d com.apple.quarantine ~/bin/ac-helper 2>/dev/null || true
 **Linux — x86_64 (Intel/AMD servers, most CI runners):**
 
 ```sh
-curl -L https://github.com/davorian/claude-autonomous-pipeline/releases/latest/download/ac-helper-linux-amd64 -o ~/bin/ac-helper
+gh release download --repo davorian/claude-autonomous-pipeline \
+  --pattern 'ac-helper-linux-amd64' --output ~/bin/ac-helper --clobber
 chmod +x ~/bin/ac-helper
 ```
 
 **Linux — arm64 (Graviton, Raspberry Pi 4/5, arm64 CI):**
 
 ```sh
-curl -L https://github.com/davorian/claude-autonomous-pipeline/releases/latest/download/ac-helper-linux-arm64 -o ~/bin/ac-helper
+gh release download --repo davorian/claude-autonomous-pipeline \
+  --pattern 'ac-helper-linux-arm64' --output ~/bin/ac-helper --clobber
 chmod +x ~/bin/ac-helper
 ```
 
