@@ -1,0 +1,53 @@
+name: ac-helper
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'helper/**'
+      - 'Makefile'
+      - '.github/workflows/helper.yml'
+  pull_request:
+    paths:
+      - 'helper/**'
+      - 'Makefile'
+      - '.github/workflows/helper.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+          cache-dependency-path: helper/go.mod
+      - name: vet + test
+        run: make check
+
+  build-all:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+          cache-dependency-path: helper/go.mod
+      - name: build all targets
+        run: make build-all
+      - name: upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ac-helper-binaries
+          path: dist/ac-helper-*
+          if-no-files-found: error
