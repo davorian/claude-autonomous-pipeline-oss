@@ -166,3 +166,33 @@ Next `auto_claude` run will detect and use it automatically. No config flag.
 ```sh
 rm ~/bin/ac-helper    # reverts to bash fallback on next auto_claude run
 ```
+
+## Portability contract
+
+`bin/auto_claude` targets **bash 3.2+** (macOS's stock `/bin/bash`) on
+**darwin** and **linux**. When adding code, avoid:
+
+- **GNU-only `sed` brace form** (e.g. `sed '1{/^$/d}'`) — use `awk` or
+  `-e`-separated expressions. BSD sed rejects the inline brace body.
+- **GNU-only `date` flags** (`-d`, `--date`) — prefer `date -r <epoch>`
+  or shell arithmetic with `$(date +%s)`.
+- **GNU-only `stat` flags** (`-c`, `--format`) — BSD uses `-f`. If you
+  need file stats, prefer `wc -c < file` for size or a small `find -type
+  f -printf`-free alternative.
+- **GNU-only `readlink -f`** — not on macOS. Use `cd … && pwd -P` or
+  a small realpath shim.
+- **GNU-only `grep -P`** (Perl regex) — use ERE via `grep -E`.
+- **`echo -e`** — use `printf`. `echo -e` is a bashism `echo` doesn't
+  obey consistently across distros.
+- **Bash 4+ features** — `declare -A` (associative arrays), `${var^^}`
+  case conversion, `mapfile`/`readarray`. macOS stock bash is 3.2.
+- **Unquoted `wc` output in numeric contexts** — BSD pads with spaces.
+  `[ "$(echo x | wc -l)" -gt 0 ]` happens to work because bash
+  tolerates leading whitespace in numeric tests, but prefer
+  `wc -l < file | tr -d ' '` for display and for safety on stricter
+  shells.
+
+Classes of bug in parsing or JSON manipulation — multi-line `grep | cut`
+output leaking into numeric tests, ERR-trap propagation through
+`$(…)` substitutions — should go to the Go helper rather than get
+worked around in shell (see "Install ac-helper" above).

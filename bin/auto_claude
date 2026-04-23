@@ -1847,8 +1847,8 @@ _discover_test_suites() {
 
 # Per-suite exit codes and outputs, keyed by suite name.
 # Used by _diagnose_suite_failure to inspect individual failures.
-# Using declare -A inside a function scope to avoid set -u issues at top level.
-# Temp directory for per-suite outputs and exit codes (avoids associative arrays).
+# Storage is a temp directory with per-suite files rather than a bash-4
+# associative array — portable to macOS's stock /bin/bash 3.2.
 _SUITE_TMP_DIR=""
 
 _suite_tmp_dir() {
