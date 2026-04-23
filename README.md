@@ -47,3 +47,95 @@ tests/
 ```
 
 Requires `.auto_claude.conf` in the project root. See `conf/` for examples and `docs/auto_claude.md` for full documentation.
+
+## Install `ac-helper` (optional but recommended)
+
+`ac-helper` is a small Go binary that handles the parsing surface of
+`auto_claude` (JSON extraction from Claude responses, response-field
+parsing). It kills a class of recurring bash bugs. The bash script works
+without it — it detects the binary on `PATH` and falls back to hardened
+bash if absent — but having it on is strictly better.
+
+### Seamless install (one-liner)
+
+Installs to `~/bin/ac-helper` (change with `PREFIX=/usr/local`, etc.). The
+script detects OS + architecture, downloads the right binary, and strips
+macOS Gatekeeper quarantine automatically.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/davorian/claude-autonomous-pipeline/main/install.sh | sh
+```
+
+Pin a specific version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/davorian/claude-autonomous-pipeline/main/install.sh | VERSION=v0.1.0 sh
+```
+
+### Per-platform manual install
+
+If you'd rather pull the binary yourself. Replace `latest` with a version
+tag (`v0.1.0`) to pin.
+
+**macOS — Apple Silicon (M1/M2/M3/M4):**
+
+```sh
+curl -L https://github.com/davorian/claude-autonomous-pipeline/releases/latest/download/ac-helper-darwin-arm64 -o ~/bin/ac-helper
+chmod +x ~/bin/ac-helper
+xattr -d com.apple.quarantine ~/bin/ac-helper 2>/dev/null || true
+```
+
+**macOS — Intel:**
+
+```sh
+curl -L https://github.com/davorian/claude-autonomous-pipeline/releases/latest/download/ac-helper-darwin-amd64 -o ~/bin/ac-helper
+chmod +x ~/bin/ac-helper
+xattr -d com.apple.quarantine ~/bin/ac-helper 2>/dev/null || true
+```
+
+**Linux — x86_64 (Intel/AMD servers, most CI runners):**
+
+```sh
+curl -L https://github.com/davorian/claude-autonomous-pipeline/releases/latest/download/ac-helper-linux-amd64 -o ~/bin/ac-helper
+chmod +x ~/bin/ac-helper
+```
+
+**Linux — arm64 (Graviton, Raspberry Pi 4/5, arm64 CI):**
+
+```sh
+curl -L https://github.com/davorian/claude-autonomous-pipeline/releases/latest/download/ac-helper-linux-arm64 -o ~/bin/ac-helper
+chmod +x ~/bin/ac-helper
+```
+
+### Build from source
+
+Requires Go 1.22+.
+
+```sh
+git clone https://github.com/davorian/claude-autonomous-pipeline.git
+cd claude-autonomous-pipeline
+make install          # → $HOME/bin/ac-helper
+# or:
+PREFIX=/usr/local make install   # → /usr/local/bin/ac-helper
+```
+
+Cross-compile all targets at once (outputs into `dist/`):
+
+```sh
+make build-all
+```
+
+### Verify
+
+```sh
+ac-helper --version
+echo '{"a":1}' | ac-helper extract-json    # → {"a":1}
+```
+
+Next `auto_claude` run will detect and use it automatically. No config flag.
+
+### Uninstall
+
+```sh
+rm ~/bin/ac-helper    # reverts to bash fallback on next auto_claude run
+```

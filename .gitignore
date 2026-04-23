@@ -1,0 +1,10 @@
+# Go helper build output
+dist/
+helper/ac-helper
+helper/helper
+
+# auto_claude per-project state (leaks into consuming repos, never into this one)
+.auto_claude_state.json
+.auto_claude_baseline
+.auto_claude_*.log
+.auto_claude_explain/
