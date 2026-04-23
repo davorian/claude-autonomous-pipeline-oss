@@ -300,12 +300,29 @@ _ensure_explain_dir() {
   mkdir -p "$EXPLAIN_DIR"
 }
 
-# Parse JSON from LAST_RESPONSE_TEXT. Three-tier extraction:
+# Parse JSON from LAST_RESPONSE_TEXT. Prefers the Go helper (`ac-helper
+# extract-json`) when available — it handles all three extraction tiers
+# natively and avoids a class of pure-bash parsing bugs (multi-line output
+# leaking into numeric tests, ERR-trap propagation through command
+# substitutions). Falls back to the hardened bash implementation otherwise.
+#
+# Tiers:
 #   1. Raw parse — response is pure JSON
 #   2. Markdown fence — JSON wrapped in ```json ... ```
 #   3. Brace extraction — JSON embedded in prose (e.g. "Here's the manifest:\n{...}")
 # Echoes the parsed JSON on success, empty string on failure.
 _extract_json_from_response() {
+  # Go helper fast-path
+  if command -v ac-helper >/dev/null 2>&1; then
+    local go_parsed
+    if go_parsed=$(printf '%s' "$LAST_RESPONSE_TEXT" | ac-helper extract-json 2>/dev/null); then
+      echo "$go_parsed"
+      return 0
+    fi
+    echo ""
+    return 1
+  fi
+
   local parsed=""
   # Tier 1: raw JSON
   if parsed=$(echo "$LAST_RESPONSE_TEXT" | jq '.' 2>/dev/null); then
@@ -321,11 +338,15 @@ _extract_json_from_response() {
     return 0
   fi
 
-  # Tier 3: find first { and last } — handles prose before/after JSON
+  # Tier 3: find first { and last } — handles prose before/after JSON.
+  # tr -cd '0-9' sanitises against multi-line or garbled grep output that
+  # would otherwise trip the numeric `-le` test; the trailing 2>/dev/null
+  # on the comparison silences any residual "integer expression expected"
+  # noise. See helper/extract.go for the robust Go implementation.
   local first_brace last_brace
-  first_brace=$(echo "$LAST_RESPONSE_TEXT" | grep -n '{' | head -1 | cut -d: -f1)
-  last_brace=$(echo "$LAST_RESPONSE_TEXT" | grep -n '}' | tail -1 | cut -d: -f1)
-  if [ -n "$first_brace" ] && [ -n "$last_brace" ] && [ "$first_brace" -le "$last_brace" ]; then
+  first_brace=$(echo "$LAST_RESPONSE_TEXT" | grep -n '{' | head -1 | cut -d: -f1 | tr -cd '0-9')
+  last_brace=$(echo "$LAST_RESPONSE_TEXT" | grep -n '}' | tail -1 | cut -d: -f1 | tr -cd '0-9')
+  if [ -n "$first_brace" ] && [ -n "$last_brace" ] && [ "$first_brace" -le "$last_brace" ] 2>/dev/null; then
     extracted=$(echo "$LAST_RESPONSE_TEXT" | sed -n "${first_brace},${last_brace}p")
     if [ -n "$extracted" ] && parsed=$(echo "$extracted" | jq '.' 2>/dev/null); then
       echo "$parsed"
@@ -772,10 +793,20 @@ _invoke_claude() {
   raw_output=$(<"$tmp_output")
   rm -f "$tmp_output"
 
-  # Parse session ID and response text from JSON
+  # Parse session ID and response text from JSON.
+  # Prefer the Go helper when available — its contract is "never fail",
+  # which prevents jq/here-string corner cases from firing the global ERR
+  # trap via command-substitution propagation.
+  # Fallback: keep `|| true` *inside* the $(...) so a jq failure exits the
+  # subshell at 0 rather than leaking to the assignment.
   local session_id response_text
-  session_id=$(jq -r '.session_id // empty' <<< "$raw_output" 2>/dev/null) || true
-  response_text=$(jq -r '.result // empty' <<< "$raw_output" 2>/dev/null) || true
+  if command -v ac-helper >/dev/null 2>&1; then
+    session_id=$(printf '%s' "$raw_output" | ac-helper parse-claude-response --field=session_id 2>/dev/null)
+    response_text=$(printf '%s' "$raw_output" | ac-helper parse-claude-response --field=result 2>/dev/null)
+  else
+    session_id=$(jq -r '.session_id // empty' <<< "$raw_output" 2>/dev/null || true)
+    response_text=$(jq -r '.result // empty' <<< "$raw_output" 2>/dev/null || true)
+  fi
 
   # If JSON parsing failed, treat raw output as response text
   if [ -z "$response_text" ]; then
@@ -3521,7 +3552,10 @@ $(cat "${PROJECT_ROOT}/.cursor/BUGBOT.md")
       if [ "$include" = true ]; then
         # Strip YAML frontmatter, keep body
         local body
-        body=$(sed -n '/^---$/,/^---$/!p' "$mdc_file" | sed '1{/^$/d}')
+        # awk replaces `sed '1{/^$/d}'` — BSD/macOS sed rejects that brace
+        # form. This drops the first line only if it's blank, portably
+        # across GNU (Linux/CI) and BSD (macOS).
+        body=$(sed -n '/^---$/,/^---$/!p' "$mdc_file" | awk 'NR==1 && /^$/ { next } { print }')
         if [ -n "$body" ]; then
           org_rules+="
 #### ${relative_path}
