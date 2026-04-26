@@ -1,0 +1,198 @@
+#!/bin/bash
+# sme-ab-run — A/B harness wrapper around auto_claude.
+#
+# Runs auto_claude with optional SME priming injected via
+# AUTO_CLAUDE_PROMPT_PREAMBLE, captures per-run metrics including
+# task_type, and appends one row to the runs.jsonl ledger.
+#
+# Usage:
+#   sme-ab-run --spec PATH --task-type TYPE --sme-mode {on|off}
+#              [--repo-id ID] [--out PATH] [--max-tokens N]
+#              [--auto-claude PATH]
+#
+#   --spec       path to the auto_claude spec.md
+#   --task-type  one of: feature bugfix refactor greenfield new-pattern
+#                        cross-cutting other
+#   --sme-mode   on  → run sme-prompt-context, set preamble env var
+#                off → run auto_claude with no preamble (control)
+#   --repo-id    SME repo id (default: derived from cwd's git remote)
+#   --out        runs.jsonl path (default: ~/.claude-pipeline/ab-runs/runs.jsonl)
+#   --max-tokens preamble cap when --sme-mode on (default: 2000)
+#   --auto-claude path to the auto_claude binary (default: ~/bin/auto_claude)
+#
+# Exit code mirrors auto_claude's. The metrics row is appended even on
+# failure so the ledger captures the failure case too.
+
+set -Eeuo pipefail
+
+_die() { echo "ERROR: $*" >&2; exit 1; }
+
+VALID_TASK_TYPES="feature bugfix refactor greenfield new-pattern cross-cutting other"
+
+# ─── Argument parsing ────────────────────────────────────────────────────────
+SPEC=""
+TASK_TYPE=""
+SME_MODE=""
+REPO_ID=""
+OUT_FILE=""
+MAX_TOKENS="2000"
+AUTO_CLAUDE_BIN="$HOME/bin/auto_claude"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --spec)        SPEC="${2:?--spec needs value}"; shift 2 ;;
+    --task-type)   TASK_TYPE="${2:?--task-type needs value}"; shift 2 ;;
+    --sme-mode)    SME_MODE="${2:?--sme-mode needs value}"; shift 2 ;;
+    --repo-id)     REPO_ID="${2:?--repo-id needs value}"; shift 2 ;;
+    --out)         OUT_FILE="${2:?--out needs value}"; shift 2 ;;
+    --max-tokens)  MAX_TOKENS="${2:?--max-tokens needs value}"; shift 2 ;;
+    --auto-claude) AUTO_CLAUDE_BIN="${2:?--auto-claude needs value}"; shift 2 ;;
+    -h|--help) sed -n '/^# Usage:/,/^# Exit/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) _die "unknown arg: $1" ;;
+  esac
+done
+
+[[ -n "$SPEC" ]]      || _die "--spec is required"
+[[ -n "$TASK_TYPE" ]] || _die "--task-type is required"
+[[ -n "$SME_MODE" ]]  || _die "--sme-mode is required"
+
+case " $VALID_TASK_TYPES " in
+  *" $TASK_TYPE "*) ;;
+  *) _die "task_type must be one of: $VALID_TASK_TYPES (got: $TASK_TYPE)" ;;
+esac
+
+[[ "$SME_MODE" = "on" || "$SME_MODE" = "off" ]] \
+  || _die "sme-mode must be 'on' or 'off' (got: $SME_MODE)"
+
+[[ -f "$SPEC" ]] || _die "spec not found: $SPEC"
+[[ -x "$AUTO_CLAUDE_BIN" ]] || _die "auto_claude binary not found or not executable: $AUTO_CLAUDE_BIN"
+
+# Resolve to absolute paths
+SPEC=$(cd "$(dirname "$SPEC")" && pwd)/$(basename "$SPEC")
+
+# ─── Resolve repo_id (cwd-relative if not given) ─────────────────────────────
+if [[ -z "$REPO_ID" ]]; then
+  remote=$(git -C "$(dirname "$SPEC")" remote get-url origin 2>/dev/null \
+    || git remote get-url origin 2>/dev/null || true)
+  if [[ -n "$remote" ]]; then
+    remote="${remote%.git}"
+    remote="${remote%/}"
+    if [[ "$remote" =~ :([^/]+)/([^/]+)$ ]]; then
+      REPO_ID="${BASH_REMATCH[1]}__${BASH_REMATCH[2]}"
+    elif [[ "$remote" =~ /([^/]+)/([^/]+)$ ]]; then
+      REPO_ID="${BASH_REMATCH[1]}__${BASH_REMATCH[2]}"
+    fi
+  fi
+  [[ -n "$REPO_ID" ]] || _die "could not derive --repo-id; pass it explicitly"
+fi
+
+# ─── Output path ─────────────────────────────────────────────────────────────
+[[ -z "$OUT_FILE" ]] && OUT_FILE="$HOME/.claude-pipeline/ab-runs/runs.jsonl"
+mkdir -p "$(dirname "$OUT_FILE")"
+touch "$OUT_FILE"
+
+# ─── SME priming ─────────────────────────────────────────────────────────────
+PREAMBLE=""
+PREAMBLE_SIZE_CHARS=0
+if [[ "$SME_MODE" = "on" ]]; then
+  CTX_BIN="$(dirname "$AUTO_CLAUDE_BIN")/sme-prompt-context"
+  [[ -x "$CTX_BIN" ]] || _die "sme-prompt-context not found at $CTX_BIN"
+  PREAMBLE=$("$CTX_BIN" --repo-id "$REPO_ID" --spec "$SPEC" --max-tokens "$MAX_TOKENS")
+  PREAMBLE_SIZE_CHARS=${#PREAMBLE}
+fi
+
+# ─── Run ─────────────────────────────────────────────────────────────────────
+RUN_ID=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
+STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+START_EPOCH=$(date +%s)
+
+# Capture baseline diff state — we'll diff against this at the end
+PROJECT_ROOT=$(cd "$(dirname "$SPEC")" && git rev-parse --show-toplevel 2>/dev/null || echo "")
+BASELINE_SHA=""
+if [[ -n "$PROJECT_ROOT" ]]; then
+  BASELINE_SHA=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")
+fi
+
+set +e
+if [[ "$SME_MODE" = "on" ]]; then
+  AUTO_CLAUDE_PROMPT_PREAMBLE="$PREAMBLE" "$AUTO_CLAUDE_BIN" "$SPEC"
+else
+  unset AUTO_CLAUDE_PROMPT_PREAMBLE
+  "$AUTO_CLAUDE_BIN" "$SPEC"
+fi
+EXIT_CODE=$?
+set -e
+
+FINISHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+END_EPOCH=$(date +%s)
+DURATION=$((END_EPOCH - START_EPOCH))
+
+# ─── Capture metrics ─────────────────────────────────────────────────────────
+OUTCOME=$([ "$EXIT_CODE" -eq 0 ] && echo "success" || echo "failed")
+
+PHASES_COMPLETED=0
+STATE_FILE=""
+if [[ -n "$PROJECT_ROOT" ]]; then
+  STATE_FILE="$PROJECT_ROOT/.auto_claude_state.json"
+  if [[ -f "$STATE_FILE" ]]; then
+    PHASES_COMPLETED=$(jq '[.phases | to_entries[] | select(.value.status == "completed")] | length' "$STATE_FILE" 2>/dev/null || echo 0)
+  fi
+fi
+
+DIFF_ADDED=0
+DIFF_REMOVED=0
+FINAL_SHA=""
+if [[ -n "$PROJECT_ROOT" && -n "$BASELINE_SHA" ]]; then
+  FINAL_SHA=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")
+  if [[ -n "$FINAL_SHA" ]]; then
+    diff_stats=$(git -C "$PROJECT_ROOT" diff --shortstat "$BASELINE_SHA" "$FINAL_SHA" 2>/dev/null || echo "")
+    DIFF_ADDED=$(echo "$diff_stats" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)
+    DIFF_REMOVED=$(echo "$diff_stats" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)
+    [[ -z "$DIFF_ADDED" ]] && DIFF_ADDED=0
+    [[ -z "$DIFF_REMOVED" ]] && DIFF_REMOVED=0
+  fi
+fi
+
+# ─── Append row ──────────────────────────────────────────────────────────────
+jq -nc \
+  --arg run_id "$RUN_ID" \
+  --arg spec "$SPEC" \
+  --arg repo_id "$REPO_ID" \
+  --arg task_type "$TASK_TYPE" \
+  --arg sme_mode "$SME_MODE" \
+  --arg started_at "$STARTED_AT" \
+  --arg finished_at "$FINISHED_AT" \
+  --arg duration "$DURATION" \
+  --arg outcome "$OUTCOME" \
+  --arg exit_code "$EXIT_CODE" \
+  --arg phases "$PHASES_COMPLETED" \
+  --arg added "$DIFF_ADDED" \
+  --arg removed "$DIFF_REMOVED" \
+  --arg baseline "$BASELINE_SHA" \
+  --arg final "$FINAL_SHA" \
+  --arg preamble_size "$PREAMBLE_SIZE_CHARS" \
+  '{
+    run_id: $run_id,
+    spec: $spec,
+    repo_id: $repo_id,
+    task_type: $task_type,
+    sme_mode: $sme_mode,
+    started_at: $started_at,
+    finished_at: $finished_at,
+    duration_seconds: ($duration | tonumber),
+    outcome: $outcome,
+    exit_code: ($exit_code | tonumber),
+    phases_completed: ($phases | tonumber),
+    git_diff_added: ($added | tonumber),
+    git_diff_removed: ($removed | tonumber),
+    baseline_sha: $baseline,
+    final_sha: $final,
+    preamble_size_chars: ($preamble_size | tonumber),
+    review_score: null
+  }' >> "$OUT_FILE"
+
+echo "" >&2
+echo "[sme-ab-run] run_id=$RUN_ID outcome=$OUTCOME duration=${DURATION}s sme_mode=$SME_MODE task_type=$TASK_TYPE" >&2
+echo "[sme-ab-run] appended to $OUT_FILE" >&2
+
+exit "$EXIT_CODE"
