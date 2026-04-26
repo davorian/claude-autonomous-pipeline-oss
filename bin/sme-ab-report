@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""
+sme-ab-report — Aggregate runs.jsonl into an A/B comparison by task_type.
+
+Reads the runs ledger, groups by (task_type, sme_mode), computes
+aggregates per-mode, and prints a side-by-side comparison so you can
+see whether SME-on is paying for itself per task class.
+
+Usage:
+    sme-ab-report [--since N] [--task-type T] [--in PATH]
+
+    --since N       restrict to runs in the last N days
+    --task-type T   restrict to a single task_type
+    --in PATH       runs.jsonl path (default: ~/.claude-pipeline/ab-runs/runs.jsonl)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import statistics as stats
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+
+def parse_runs(path: Path, since_days: int | None, task_filter: str | None) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    cutoff = None
+    if since_days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if task_filter and row.get("task_type") != task_filter:
+            continue
+        if cutoff is not None:
+            ts = row.get("started_at") or ""
+            try:
+                row_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if row_dt < cutoff:
+                    continue
+            except (ValueError, TypeError):
+                continue
+        rows.append(row)
+    return rows
+
+
+def safe_mean(xs: list[float]) -> float | None:
+    return stats.fmean(xs) if xs else None
+
+
+def safe_median(xs: list[float]) -> float | None:
+    return stats.median(xs) if xs else None
+
+
+def fmt(v: float | int | None, suffix: str = "") -> str:
+    if v is None:
+        return "-"
+    if isinstance(v, float):
+        return f"{v:.1f}{suffix}"
+    return f"{v}{suffix}"
+
+
+def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {
+            "count": 0, "success_rate": None, "duration_mean": None,
+            "duration_median": None, "diff_added_mean": None,
+            "diff_removed_mean": None, "phases_mean": None,
+            "preamble_chars_mean": None,
+        }
+    successes = sum(1 for r in rows if r.get("outcome") == "success")
+    durations = [float(r.get("duration_seconds") or 0) for r in rows]
+    diffs_a = [float(r.get("git_diff_added") or 0) for r in rows]
+    diffs_r = [float(r.get("git_diff_removed") or 0) for r in rows]
+    phases = [float(r.get("phases_completed") or 0) for r in rows]
+    preamble = [float(r.get("preamble_size_chars") or 0) for r in rows]
+    return {
+        "count": len(rows),
+        "success_rate": successes / len(rows),
+        "duration_mean": safe_mean(durations),
+        "duration_median": safe_median(durations),
+        "diff_added_mean": safe_mean(diffs_a),
+        "diff_removed_mean": safe_mean(diffs_r),
+        "phases_mean": safe_mean(phases),
+        "preamble_chars_mean": safe_mean(preamble),
+    }
+
+
+def delta_pct(on_v: float | None, off_v: float | None) -> str:
+    if on_v is None or off_v is None or off_v == 0:
+        return "-"
+    pct = (on_v - off_v) / off_v * 100
+    sign = "+" if pct > 0 else ""
+    return f"{sign}{pct:.1f}%"
+
+
+def render_task_section(task_type: str, on: dict[str, Any], off: dict[str, Any]) -> str:
+    lines: list[str] = []
+    lines.append(f"\n## task_type: {task_type}")
+    lines.append("")
+    lines.append(f"  Runs: SME-on={on['count']}  SME-off={off['count']}")
+    if on["count"] == 0 or off["count"] == 0:
+        lines.append("  (need ≥1 run in each mode for comparison)")
+        return "\n".join(lines)
+
+    rows: list[tuple[str, str, str, str]] = [
+        ("metric", "SME-on", "SME-off", "Δ%"),
+    ]
+    metrics: list[tuple[str, str, str]] = [
+        ("success rate",     "success_rate",        "%"),
+        ("duration mean",    "duration_mean",       "s"),
+        ("duration median",  "duration_median",     "s"),
+        ("phases completed", "phases_mean",         ""),
+        ("diff added",       "diff_added_mean",     ""),
+        ("diff removed",     "diff_removed_mean",   ""),
+        ("preamble chars",   "preamble_chars_mean", ""),
+    ]
+    for label, key, suffix in metrics:
+        on_v = on[key]
+        off_v = off[key]
+        if key == "success_rate":
+            on_s = f"{on_v*100:.0f}%" if on_v is not None else "-"
+            off_s = f"{off_v*100:.0f}%" if off_v is not None else "-"
+            d = delta_pct(on_v, off_v)
+        else:
+            on_s = fmt(on_v, suffix)
+            off_s = fmt(off_v, suffix)
+            d = delta_pct(on_v, off_v)
+        rows.append((label, on_s, off_s, d))
+
+    widths = [max(len(r[i]) for r in rows) for i in range(4)]
+    sep = "  ".join("─" * w for w in widths)
+    lines.append("")
+    for i, row in enumerate(rows):
+        line = "  " + "  ".join(row[j].ljust(widths[j]) for j in range(4))
+        lines.append(line)
+        if i == 0:
+            lines.append("  " + sep)
+
+    # Flag if SME-on is meaningfully worse on both duration AND diff
+    flags: list[str] = []
+    if (on["duration_mean"] and off["duration_mean"]
+        and (on["duration_mean"] - off["duration_mean"]) / off["duration_mean"] > 0.10):
+        flags.append("duration > 10% slower on SME-on")
+    if (on["success_rate"] is not None and off["success_rate"] is not None
+        and on["success_rate"] < off["success_rate"] - 0.05):
+        flags.append("success rate ≥ 5pt lower on SME-on")
+    if flags:
+        lines.append("")
+        lines.append("  ⚠ Flags: " + "; ".join(flags))
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--since", type=int, default=None, metavar="N",
+                    help="restrict to runs in the last N days")
+    ap.add_argument("--task-type", default=None, metavar="T",
+                    help="restrict to a single task_type")
+    ap.add_argument("--in", dest="in_path", type=Path,
+                    default=Path.home() / ".claude-pipeline" / "ab-runs" / "runs.jsonl",
+                    help="runs.jsonl path")
+    args = ap.parse_args()
+
+    rows = parse_runs(args.in_path, args.since, args.task_type)
+    if not rows:
+        print(f"no data at {args.in_path}"
+              + (f" (filtered by task_type={args.task_type})" if args.task_type else "")
+              + (f" (since={args.since}d)" if args.since else ""))
+        return 0
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        grouped[(r.get("task_type", "?"), r.get("sme_mode", "?"))].append(r)
+
+    task_types = sorted({k[0] for k in grouped})
+
+    print(f"# A/B report — {len(rows)} run(s)")
+    print(f"  source: {args.in_path}")
+    if args.since:
+        print(f"  since: last {args.since} days")
+    if args.task_type:
+        print(f"  task_type: {args.task_type}")
+
+    for tt in task_types:
+        on = aggregate(grouped.get((tt, "on"), []))
+        off = aggregate(grouped.get((tt, "off"), []))
+        print(render_task_section(tt, on, off))
+
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
