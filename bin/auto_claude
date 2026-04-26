@@ -136,18 +136,20 @@ PROJECT_NAME="$(basename "$PROJECT_ROOT")"
 
 _CLI_OPINIONATED=false
 _CLI_SKIP_PHASES=""
+_CLI_ONLY_PHASE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --opinionated) _CLI_OPINIONATED=true; shift ;;
     --skip) _CLI_SKIP_PHASES="${_CLI_SKIP_PHASES:+${_CLI_SKIP_PHASES},}${2:?--skip requires a phase name}"; shift 2 ;;
+    --only) _CLI_ONLY_PHASE="${2:?--only requires a phase name}"; shift 2 ;;
     --) shift; break ;;
-    -*) echo "ERROR: Unknown flag: $1" >&2; echo "Usage: auto_claude [--opinionated] [--skip <phase>]... <path-to-spec.md>" >&2; exit 1 ;;
+    -*) echo "ERROR: Unknown flag: $1" >&2; echo "Usage: auto_claude [--opinionated] [--skip <phase>]... [--only <phase>] <path-to-spec.md>" >&2; exit 1 ;;
     *) break ;;
   esac
 done
 
-SPEC_FILE="${1:?Usage: auto_claude [--opinionated] [--skip <phase>]... <path-to-spec.md>}"
+SPEC_FILE="${1:?Usage: auto_claude [--opinionated] [--skip <phase>]... [--only <phase>] <path-to-spec.md>}"
 # Resolve to absolute path so cd's in test suites do not break the reference
 if [[ "$SPEC_FILE" != /* ]]; then
   SPEC_FILE="$(pwd)/$SPEC_FILE"
@@ -300,29 +302,12 @@ _ensure_explain_dir() {
   mkdir -p "$EXPLAIN_DIR"
 }
 
-# Parse JSON from LAST_RESPONSE_TEXT. Prefers the Go helper (`ac-helper
-# extract-json`) when available — it handles all three extraction tiers
-# natively and avoids a class of pure-bash parsing bugs (multi-line output
-# leaking into numeric tests, ERR-trap propagation through command
-# substitutions). Falls back to the hardened bash implementation otherwise.
-#
-# Tiers:
+# Parse JSON from LAST_RESPONSE_TEXT. Three-tier extraction:
 #   1. Raw parse — response is pure JSON
 #   2. Markdown fence — JSON wrapped in ```json ... ```
 #   3. Brace extraction — JSON embedded in prose (e.g. "Here's the manifest:\n{...}")
 # Echoes the parsed JSON on success, empty string on failure.
 _extract_json_from_response() {
-  # Go helper fast-path
-  if command -v ac-helper >/dev/null 2>&1; then
-    local go_parsed
-    if go_parsed=$(printf '%s' "$LAST_RESPONSE_TEXT" | ac-helper extract-json 2>/dev/null); then
-      echo "$go_parsed"
-      return 0
-    fi
-    echo ""
-    return 1
-  fi
-
   local parsed=""
   # Tier 1: raw JSON
   if parsed=$(echo "$LAST_RESPONSE_TEXT" | jq '.' 2>/dev/null); then
@@ -338,11 +323,10 @@ _extract_json_from_response() {
     return 0
   fi
 
-  # Tier 3: find first { and last } — handles prose before/after JSON.
+  # Tier 3: find first { and last } — handles prose before/after JSON
   # tr -cd '0-9' sanitises against multi-line or garbled grep output that
-  # would otherwise trip the numeric `-le` test; the trailing 2>/dev/null
-  # on the comparison silences any residual "integer expression expected"
-  # noise. See helper/extract.go for the robust Go implementation.
+  # would otherwise trip the numeric `-le` test; the 2>/dev/null on the
+  # comparison silences any residual "integer expression expected" noise.
   local first_brace last_brace
   first_brace=$(echo "$LAST_RESPONSE_TEXT" | grep -n '{' | head -1 | cut -d: -f1 | tr -cd '0-9')
   last_brace=$(echo "$LAST_RESPONSE_TEXT" | grep -n '}' | tail -1 | cut -d: -f1 | tr -cd '0-9')
@@ -794,19 +778,12 @@ _invoke_claude() {
   rm -f "$tmp_output"
 
   # Parse session ID and response text from JSON.
-  # Prefer the Go helper when available — its contract is "never fail",
-  # which prevents jq/here-string corner cases from firing the global ERR
-  # trap via command-substitution propagation.
-  # Fallback: keep `|| true` *inside* the $(...) so a jq failure exits the
-  # subshell at 0 rather than leaking to the assignment.
+  # `|| true` lives INSIDE the command substitution so that a jq failure
+  # (e.g. non-JSON response, here-string corner case) can never propagate
+  # a non-zero exit to the assignment and fire the global ERR trap.
   local session_id response_text
-  if command -v ac-helper >/dev/null 2>&1; then
-    session_id=$(printf '%s' "$raw_output" | ac-helper parse-claude-response --field=session_id 2>/dev/null)
-    response_text=$(printf '%s' "$raw_output" | ac-helper parse-claude-response --field=result 2>/dev/null)
-  else
-    session_id=$(jq -r '.session_id // empty' <<< "$raw_output" 2>/dev/null || true)
-    response_text=$(jq -r '.result // empty' <<< "$raw_output" 2>/dev/null || true)
-  fi
+  session_id=$(jq -r '.session_id // empty' <<< "$raw_output" 2>/dev/null || true)
+  response_text=$(jq -r '.result // empty' <<< "$raw_output" 2>/dev/null || true)
 
   # If JSON parsing failed, treat raw output as response text
   if [ -z "$response_text" ]; then
@@ -3419,13 +3396,24 @@ phase_loc_enforcement() {
 
 ${long_files}
 
-Refactor each file:
-1. Extract logical units into separate modules
-2. Maintain all existing exports (no breaking changes)
-3. Update imports in dependent files
-4. Ensure tests still pass after refactoring
+The line count is a trigger, not the rubric. Split on the **Single Responsibility Principle**: each resulting file should have one reason to change. Before extracting, identify the distinct concerns the file currently holds (e.g. data access, business rules, formatting, orchestration, type definitions) — then extract each concern into its own module named after that concern.
 
-If a file cannot be meaningfully split further (e.g. it is a thin orchestrator with re-exports), explain why and move on."
+Refactor each file:
+1. **Identify concerns** — list the responsibilities the file conflates. If it holds only one (a long but cohesive pure function, a single UI component, a thin orchestrator of re-exports), the line count may be an acceptable tradeoff — explain why and move on.
+2. **Extract along concern boundaries** — not line-count boundaries. Name new files after the concern they own (e.g. \`userRepository.ts\`, \`userValidation.ts\`, not \`userHelpers2.ts\`).
+3. **Maintain all existing exports** (no breaking changes).
+4. **Update imports** in dependent files.
+5. **Ensure tests still pass** after refactoring.
+
+Red flags that a split is cohesion-preserving and right:
+- Each new file has a single exported concept (or a tight cluster of one concept + its types).
+- Each new file could be unit-tested independently.
+- You can name each new file's responsibility in one short sentence.
+
+Red flags that a split is mechanical/wrong:
+- New file names end in \`Utils\`, \`Helpers\`, \`Misc\`, or numbered suffixes.
+- Functions that always call each other are in separate files.
+- Types are separated from the only code that uses them."
 
     if [ "$first_call" = true ]; then
       run_claude_fresh "${context}
@@ -3552,9 +3540,8 @@ $(cat "${PROJECT_ROOT}/.cursor/BUGBOT.md")
       if [ "$include" = true ]; then
         # Strip YAML frontmatter, keep body
         local body
-        # awk replaces `sed '1{/^$/d}'` — BSD/macOS sed rejects that brace
-        # form. This drops the first line only if it's blank, portably
-        # across GNU (Linux/CI) and BSD (macOS).
+        # awk replaces `sed '1{/^$/d}'` (GNU-only brace form) — BSD/macOS
+        # sed rejects it. Drops the first line only if it's blank.
         body=$(sed -n '/^---$/,/^---$/!p' "$mdc_file" | awk 'NR==1 && /^$/ { next } { print }')
         if [ -n "$body" ]; then
           org_rules+="
@@ -3632,6 +3619,7 @@ ${FRESH_REVIEW_EXTRAS:+${FRESH_REVIEW_EXTRAS}
    - Unnecessary abstractions?
    - Dead code or unused imports?
    - Naming consistency with the rest of the codebase?
+   - **Single Responsibility** — does each changed file hold one cohesive responsibility? Red flags: a file mixes data access with business logic with formatting; a function has multiple 'reasons to change'; changes in this PR required editing more than one file to support the *same* new concern (violates principle 5). If a file conflates concerns, name them and propose a split along concern boundaries (not line-count boundaries).
 
 3. **Security**
    - Hardcoded secrets?
@@ -3809,22 +3797,76 @@ _detect_artifacts
 
 [ "$_CLI_OPINIONATED" = true ] && OPINIONATED=true
 
-# The four principles — shared between both modes, framing differs.
+# The five principles — shared between both modes, framing differs.
 _OPINIONATED_PRINCIPLES='''1. **Discriminated unions over optional fields** — when a type has distinct
    states, use tagged unions so each variant carries exactly the fields it needs.
    Make impossible states impossible at compile time.
 
 2. **Ports and adapters at natural seams** — where the code crosses a boundary
-   (external service, CLI tool, config system), define a port (interface/function
-   convention) and keep adapters separate. The core should not know which adapter
-   is wired in.
+   (external service, CLI tool, config system, **database**), define a port
+   (interface/function convention) and keep adapters separate. The core should
+   not know which adapter is wired in. For database access specifically: route
+   all queries through repository functions named after the entity
+   (e.g. \`getCompanyById\`, \`listUserGoals\`). Direct ORM calls from pages,
+   components, or services are red flags — they scatter query shapes across the
+   codebase and make schema evolution an archaeological dig.
 
 3. **Prefer simpler by default** — when two approaches are valid, default to the
    less complex one. Add abstraction only when the simpler option demonstrably
    cannot serve the need.
 
 4. **Defer to existing patterns** — examine the codebase first. Follow existing
-   patterns unless the requirement genuinely cannot be served by them.'''
+   patterns unless the requirement genuinely cannot be served by them.
+
+5. **Isolate variant handling at a single boundary** — when a route needs to
+   serve a new variant (unauth access, beta role, flag-gated flow), concentrate
+   the branching at ONE entry point (middleware, a route group, or a top-level
+   guard). Do not thread `if (variant)` conditionals through shared layouts,
+   components, or utilities that were built around the default case. Red flags:
+   the same PR adds a conditional for the new case in more than one file, a
+   shared component is conditionally bypassed, or a comment explains why the
+   normal pattern is being broken.'''
+
+# ─── Business-Domain Framing — always on ──────────────────────────────────
+# Applied to plan, review, and fresh_review regardless of opinionated mode.
+# Keeps the output oriented to the business reason first, mechanism second.
+# Engineers and systems age well when the code reflects the domain; the habit
+# of domain-first explanation is rare *structurally*, so we enforce it here.
+_DOMAIN_FRAMING_FRAGMENT='''## Framing — Business-Domain First
+
+Adopt the posture of a **forward-deployed business analyst / developer**:
+embedded with the business, not sitting outside it. Your first job is to make
+the business reason crisp; your second is to map it to the code.
+
+Apply this framing throughout the output:
+
+- **Plans** — lead with a short "Business context" section: the domain this
+  change sits in, the broader initiative, where this specific work fits, and
+  the acceptance criteria phrased in business terms. Only then drill into the
+  deliverables.
+- **Reviews** — first-pass question: *does this reflect the domain, or is it
+  working against it?* Flag domain misalignment as a named finding alongside
+  technical issues.
+- **Explanations** — domain frame before mechanism. "Why does X exist?" is
+  answered first in ownership / authorization / billing / multi-tenancy / UX
+  terms, then with code references.
+- **Docs** — capture the why, not just the what. Implementations rot but
+  principles do not; a well-framed domain explanation stays accurate for
+  years even as code evolves.
+
+A plan or review that does not lead with the business domain is evidence the
+posture has slipped — rewrite with the frame up front.'''
+
+# Inject into plan + review phases, always (independent of opinionated mode).
+PLAN_CONTEXT="${_DOMAIN_FRAMING_FRAGMENT}${PLAN_CONTEXT:+
+
+${PLAN_CONTEXT}}"
+REVIEW_EXTRAS="${_DOMAIN_FRAMING_FRAGMENT}${REVIEW_EXTRAS:+
+
+${REVIEW_EXTRAS}}"
+FRESH_REVIEW_PREAMBLE="${_DOMAIN_FRAMING_FRAGMENT}${FRESH_REVIEW_PREAMBLE:+
+
+${FRESH_REVIEW_PREAMBLE}}"
 
 if [ "$OPINIONATED" = true ]; then
   _OPINIONATED_FRAGMENT="## Architectural Standards (enforced)
@@ -3940,6 +3982,23 @@ unset _startup_ci_checks _c _ci_name _ci_strat
 main() {
   local start_phase=1
 
+  # --only: revive a prior completed run so the target phase can re-execute
+  # with session continuity from adjacent authoring phases. Flipping run.status
+  # back to "running" lets the existing resume logic below hydrate
+  # RESUME_SESSION_ID from state; resetting the target's status lets the loop
+  # actually execute it.
+  if [ -n "$_CLI_ONLY_PHASE" ] && [ -f "$STATE_FILE" ]; then
+    local _prior_status
+    _prior_status=$(_state_get '.run.status')
+    if [ "$_prior_status" = "completed" ]; then
+      log INFO "--only: reviving prior run to re-execute '${_CLI_ONLY_PHASE}'"
+      _jq_update '.run.status = "running"'
+      _jq_update --arg p "$_CLI_ONLY_PHASE" \
+        '.phases[$p] = ((.phases[$p] // {}) + {status: "", completed_at: null})'
+    fi
+    unset _prior_status
+  fi
+
   # Check for existing state file from a crashed run
   if [ -f "$STATE_FILE" ]; then
     local run_status
@@ -4011,6 +4070,41 @@ main() {
   fi
 
   _load_ownership_manifest
+
+  # --only handling: expand into --skip of other phases, force start_phase to
+  # the target, and (for post-seam quality phases) clear any inherited resume
+  # session so fresh-by-design phases like fresh_review stay unbiased.
+  if [ -n "$_CLI_ONLY_PHASE" ]; then
+    if [ -n "$_CLI_SKIP_PHASES" ]; then
+      log ERROR "--only and --skip cannot be combined"
+      exit 1
+    fi
+    local _target_idx=0 _seam_idx=0 _idx=0
+    for _p in "${PHASES[@]}"; do
+      _idx=$((_idx + 1))
+      [ "$_p" = "$_CLI_ONLY_PHASE" ] && _target_idx=$_idx
+      [ "$_p" = "$SEAM_AFTER" ] && _seam_idx=$_idx
+    done
+    if [ "$_target_idx" -eq 0 ]; then
+      log ERROR "Unknown phase in --only: $_CLI_ONLY_PHASE (valid: ${PHASES[*]})"
+      exit 1
+    fi
+    # Expand into --skip for every non-target phase
+    for _p in "${PHASES[@]}"; do
+      if [ "$_p" != "$_CLI_ONLY_PHASE" ]; then
+        _CLI_SKIP_PHASES="${_CLI_SKIP_PHASES:+${_CLI_SKIP_PHASES},}${_p}"
+      fi
+    done
+    # Force the loop to reach the target regardless of prior resume computation
+    start_phase=$_target_idx
+    # Quality-block phases are fresh by design — clear any authoring session id
+    if [ "$_target_idx" -gt "$_seam_idx" ] && [ -n "$RESUME_SESSION_ID" ]; then
+      log INFO "--only: clearing resume session ('${_CLI_ONLY_PHASE}' is a quality phase — starts fresh)"
+      RESUME_SESSION_ID=""
+    fi
+    log INFO "Running only phase '${_CLI_ONLY_PHASE}' (all others will be skipped)"
+    unset _p _idx _target_idx _seam_idx
+  fi
 
   # Apply --skip flags: mark requested phases as completed so the loop skips them
   if [ -n "$_CLI_SKIP_PHASES" ]; then
