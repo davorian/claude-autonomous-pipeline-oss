@@ -2,16 +2,20 @@
 """
 sme-ab-report — Aggregate runs.jsonl into an A/B comparison by task_type.
 
-Reads the runs ledger, groups by (task_type, sme_mode), computes
-aggregates per-mode, and prints a side-by-side comparison so you can
-see whether SME-on is paying for itself per task class.
+Reads the runs ledger and joins to scores.jsonl (latest score per run_id).
+Groups by (task_type, sme_mode), computes aggregates per-mode, and prints
+side-by-side comparison plus paired-only stats and a classifier audit.
 
 Usage:
-    sme-ab-report [--since N] [--task-type T] [--in PATH]
+    sme-ab-report [--since N] [--task-type T] [--in PATH] [--scores PATH]
+                  [--paired-only] [--classifier-audit]
 
-    --since N       restrict to runs in the last N days
-    --task-type T   restrict to a single task_type
-    --in PATH       runs.jsonl path (default: ~/.claude-pipeline/ab-runs/runs.jsonl)
+    --since N            restrict to runs in the last N days
+    --task-type T        restrict to a single task_type
+    --in PATH            runs.jsonl path (default: ~/.claude-pipeline/ab-runs/runs.jsonl)
+    --scores PATH        scores.jsonl path (default: ~/.claude-pipeline/ab-runs/scores.jsonl)
+    --paired-only        show only paired-run comparison (skip per-task aggregate)
+    --classifier-audit   show task_type_source breakdown
 """
 from __future__ import annotations
 
@@ -76,7 +80,7 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "count": 0, "success_rate": None, "duration_mean": None,
             "duration_median": None, "diff_added_mean": None,
             "diff_removed_mean": None, "phases_mean": None,
-            "preamble_chars_mean": None,
+            "preamble_chars_mean": None, "score_mean": None,
         }
     successes = sum(1 for r in rows if r.get("outcome") == "success")
     durations = [float(r.get("duration_seconds") or 0) for r in rows]
@@ -84,6 +88,7 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     diffs_r = [float(r.get("git_diff_removed") or 0) for r in rows]
     phases = [float(r.get("phases_completed") or 0) for r in rows]
     preamble = [float(r.get("preamble_size_chars") or 0) for r in rows]
+    scores = [float(r["__score__"]) for r in rows if r.get("__score__") is not None]
     return {
         "count": len(rows),
         "success_rate": successes / len(rows),
@@ -93,7 +98,33 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "diff_removed_mean": safe_mean(diffs_r),
         "phases_mean": safe_mean(phases),
         "preamble_chars_mean": safe_mean(preamble),
+        "score_mean": safe_mean(scores),
+        "scored_count": len(scores),
     }
+
+
+def load_latest_scores(path: Path) -> dict[str, int]:
+    """Read scores.jsonl, return {run_id: latest_score} (by scored_at)."""
+    if not path.is_file():
+        return {}
+    by_run: dict[str, tuple[str, int]] = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rid = row.get("run_id")
+        score = row.get("score")
+        ts = row.get("scored_at") or ""
+        if rid is None or not isinstance(score, (int, float)):
+            continue
+        prev = by_run.get(rid)
+        if prev is None or ts > prev[0]:
+            by_run[rid] = (ts, int(score))
+    return {rid: s for rid, (_, s) in by_run.items()}
 
 
 def delta_pct(on_v: float | None, off_v: float | None) -> str:
@@ -124,6 +155,7 @@ def render_task_section(task_type: str, on: dict[str, Any], off: dict[str, Any])
         ("diff added",       "diff_added_mean",     ""),
         ("diff removed",     "diff_removed_mean",   ""),
         ("preamble chars",   "preamble_chars_mean", ""),
+        ("review_score",     "score_mean",          " (1-5)"),
     ]
     for label, key, suffix in metrics:
         on_v = on[key]
@@ -162,6 +194,64 @@ def render_task_section(task_type: str, on: dict[str, Any], off: dict[str, Any])
     return "\n".join(lines)
 
 
+def render_paired_section(rows: list[dict[str, Any]]) -> str:
+    """Per-pair comparison: each pair_id has one off + one on row."""
+    pairs: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    for r in rows:
+        pid = r.get("pair_id")
+        if not pid:
+            continue
+        pairs[pid][r.get("sme_mode", "?")] = r
+
+    complete = {pid: m for pid, m in pairs.items() if "on" in m and "off" in m}
+    if not complete:
+        return "\n## paired-runs\n\n  (no complete pairs in ledger yet — use --paired on a run)"
+
+    lines: list[str] = ["", f"## paired-runs ({len(complete)} pairs)", ""]
+    on_faster = 0
+    on_higher_score = 0
+    for pid, m in complete.items():
+        off, on = m["off"], m["on"]
+        d_off = float(off.get("duration_seconds") or 0)
+        d_on = float(on.get("duration_seconds") or 0)
+        if d_on < d_off:
+            on_faster += 1
+        s_off = off.get("__score__")
+        s_on = on.get("__score__")
+        if s_on is not None and s_off is not None and s_on > s_off:
+            on_higher_score += 1
+
+    lines.append(f"  SME-on faster on duration:    {on_faster}/{len(complete)}")
+    if on_higher_score > 0:
+        lines.append(f"  SME-on higher review_score:   {on_higher_score}/{len(complete)} (where both scored)")
+    return "\n".join(lines)
+
+
+def render_classifier_audit(rows: list[dict[str, Any]]) -> str:
+    """Show task_type_source breakdown — auto vs manual vs override."""
+    by_source: dict[str, int] = defaultdict(int)
+    overrides_by_target: dict[str, int] = defaultdict(int)
+    for r in rows:
+        src = r.get("task_type_source") or "(unset)"
+        by_source[src] += 1
+        if src == "manual-override":
+            overrides_by_target[r.get("task_type", "?")] += 1
+
+    lines: list[str] = ["", "## classifier audit", ""]
+    total = sum(by_source.values())
+    for src in sorted(by_source.keys()):
+        pct = by_source[src] / total * 100 if total else 0
+        lines.append(f"  {src:<20} {by_source[src]:>4}  ({pct:.0f}%)")
+
+    if overrides_by_target:
+        lines.append("")
+        lines.append("  manual-overrides — what humans changed it to:")
+        for tt in sorted(overrides_by_target.keys()):
+            lines.append(f"    → {tt}: {overrides_by_target[tt]}")
+
+    return "\n".join(lines)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--since", type=int, default=None, metavar="N",
@@ -171,6 +261,11 @@ def main() -> int:
     ap.add_argument("--in", dest="in_path", type=Path,
                     default=Path.home() / ".claude-pipeline" / "ab-runs" / "runs.jsonl",
                     help="runs.jsonl path")
+    ap.add_argument("--scores", dest="scores_path", type=Path,
+                    default=Path.home() / ".claude-pipeline" / "ab-runs" / "scores.jsonl",
+                    help="scores.jsonl path")
+    ap.add_argument("--paired-only", action="store_true")
+    ap.add_argument("--classifier-audit", action="store_true")
     args = ap.parse_args()
 
     rows = parse_runs(args.in_path, args.since, args.task_type)
@@ -180,6 +275,12 @@ def main() -> int:
               + (f" (since={args.since}d)" if args.since else ""))
         return 0
 
+    # Join scores by run_id (latest score wins)
+    scores = load_latest_scores(args.scores_path)
+    for r in rows:
+        rid = r.get("run_id")
+        r["__score__"] = scores.get(rid) if rid else None
+
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         grouped[(r.get("task_type", "?"), r.get("sme_mode", "?"))].append(r)
@@ -188,15 +289,23 @@ def main() -> int:
 
     print(f"# A/B report — {len(rows)} run(s)")
     print(f"  source: {args.in_path}")
+    if args.scores_path.is_file():
+        print(f"  scores: {args.scores_path} ({len(scores)} scored)")
     if args.since:
         print(f"  since: last {args.since} days")
     if args.task_type:
         print(f"  task_type: {args.task_type}")
 
-    for tt in task_types:
-        on = aggregate(grouped.get((tt, "on"), []))
-        off = aggregate(grouped.get((tt, "off"), []))
-        print(render_task_section(tt, on, off))
+    if not args.paired_only:
+        for tt in task_types:
+            on = aggregate(grouped.get((tt, "on"), []))
+            off = aggregate(grouped.get((tt, "off"), []))
+            print(render_task_section(tt, on, off))
+
+    print(render_paired_section(rows))
+
+    if args.classifier_audit:
+        print(render_classifier_audit(rows))
 
     print()
     return 0

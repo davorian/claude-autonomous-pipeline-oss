@@ -31,20 +31,37 @@ _assert_not_contains() {
 
 _emit_row() {
   local out="$1" task="$2" mode="$3" outcome="$4" duration="$5" added="${6:-0}" preamble="${7:-0}"
+  local run_id="${8:-r-$RANDOM-$RANDOM}" pair_id="${9:-}" source="${10:-manual}"
   jq -nc \
+    --arg run_id "$run_id" --arg pair_id "$pair_id" \
     --arg task "$task" --arg mode "$mode" --arg outcome "$outcome" \
     --arg duration "$duration" --arg added "$added" --arg preamble "$preamble" \
+    --arg source "$source" \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{
-      run_id: "test", spec: "x", repo_id: "acme__widget",
-      task_type: $task, sme_mode: $mode, started_at: $ts, finished_at: $ts,
+      run_id: $run_id, spec: "x", repo_id: "acme__widget",
+      task_type: $task, task_type_source: $source, task_type_rationale: "test",
+      sme_mode: $mode,
+      pair_id: (if $pair_id == "" then null else $pair_id end),
+      started_at: $ts, finished_at: $ts,
       duration_seconds: ($duration | tonumber), outcome: $outcome,
       exit_code: (if $outcome == "success" then 0 else 1 end),
       phases_completed: 13,
       git_diff_added: ($added | tonumber), git_diff_removed: 5,
       baseline_sha: "x", final_sha: "y",
-      preamble_size_chars: ($preamble | tonumber), review_score: null
+      preamble_size_chars: ($preamble | tonumber),
+      worktree_path: "x",
+      review_score: null
     }' >> "$out"
+}
+
+_emit_score() {
+  local out="$1" run_id="$2" score="$3"
+  jq -nc \
+    --arg run_id "$run_id" --arg score "$score" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{run_id: $run_id, score: ($score | tonumber), score_source: "manual", scored_at: $ts, note: null, pr_number: null}' \
+    >> "$out"
 }
 
 echo "=== sme-ab-report ==="
@@ -126,6 +143,78 @@ touch "$RUNS"
 _emit_row "$RUNS" feature off success 100 50  0
 out=$("$SME_REPORT" --in "$RUNS")
 _assert_contains "single-mode message" "$out" "need ≥1 run in each mode"
+_teardown
+
+# 8. Score join: latest score per run_id is reflected in the row aggregate
+_setup
+RUNS="$TEST_TMPDIR/runs.jsonl"
+SCORES="$TEST_TMPDIR/scores.jsonl"
+touch "$RUNS" "$SCORES"
+_emit_row "$RUNS" feature off success 100 50 0   r-off-1
+_emit_row "$RUNS" feature on  success 90  50 200 r-on-1
+_emit_score "$SCORES" r-off-1 3
+_emit_score "$SCORES" r-on-1 5
+out=$("$SME_REPORT" --in "$RUNS" --scores "$SCORES")
+_assert_contains "score row in output"   "$out" "review_score"
+_assert_contains "scored_count surfaced" "$out" "2 scored"
+_teardown
+
+# 9. Latest-score-wins on multiple appends for same run_id
+_setup
+RUNS="$TEST_TMPDIR/runs.jsonl"
+SCORES="$TEST_TMPDIR/scores.jsonl"
+touch "$RUNS" "$SCORES"
+_emit_row "$RUNS" feature off success 100 50 0 r-A
+_emit_row "$RUNS" feature on  success 90  50 200 r-B
+_emit_score "$SCORES" r-A 1
+sleep 1
+_emit_score "$SCORES" r-A 5     # later append for the same run wins
+_emit_score "$SCORES" r-B 4
+out=$("$SME_REPORT" --in "$RUNS" --scores "$SCORES")
+# Off side has score=5 (latest of two for r-A), On side has 4
+_assert_contains "off mean reflects latest score" "$out" "5.0 (1-5)"
+_teardown
+
+# 10. Paired-runs section shows up when pair_id is set
+_setup
+RUNS="$TEST_TMPDIR/runs.jsonl"
+touch "$RUNS"
+PAIR=p-1
+_emit_row "$RUNS" feature off success 100 50 0   r-pair-off "$PAIR"
+_emit_row "$RUNS" feature on  success 90  50 200 r-pair-on  "$PAIR"
+out=$("$SME_REPORT" --in "$RUNS")
+_assert_contains "paired section header" "$out" "## paired-runs"
+_assert_contains "1 pair counted"        "$out" "(1 pairs)"
+_assert_contains "SME-on faster on duration" "$out" "SME-on faster on duration:    1/1"
+_teardown
+
+# 11. --paired-only suppresses per-task-type aggregate
+_setup
+RUNS="$TEST_TMPDIR/runs.jsonl"
+touch "$RUNS"
+_emit_row "$RUNS" feature off success 100 50 0   r-pair-off p-1
+_emit_row "$RUNS" feature on  success 90  50 200 r-pair-on  p-1
+out=$("$SME_REPORT" --in "$RUNS" --paired-only)
+echo "$out" | grep -q "task_type: feature" \
+  && _fail "--paired-only suppresses task_type sections" "task_type section still shown" \
+  || _pass "--paired-only suppresses task_type sections"
+_assert_contains "paired section still shown" "$out" "## paired-runs"
+_teardown
+
+# 12. --classifier-audit shows source breakdown
+_setup
+RUNS="$TEST_TMPDIR/runs.jsonl"
+touch "$RUNS"
+_emit_row "$RUNS" feature off success 100 50 0 r-1 "" auto
+_emit_row "$RUNS" feature on  success 90  50 200 r-2 "" auto
+_emit_row "$RUNS" bugfix  off success 100 50 0 r-3 "" manual
+_emit_row "$RUNS" bugfix  on  success 90  50 200 r-4 "" manual-override
+out=$("$SME_REPORT" --in "$RUNS" --classifier-audit)
+_assert_contains "audit header"          "$out" "## classifier audit"
+_assert_contains "auto count"            "$out" "auto"
+_assert_contains "manual count"          "$out" "manual"
+_assert_contains "manual-override count" "$out" "manual-override"
+_assert_contains "override target shown" "$out" "→ bugfix"
 _teardown
 
 echo
