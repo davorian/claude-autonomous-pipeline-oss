@@ -5,23 +5,31 @@
 # AUTO_CLAUDE_PROMPT_PREAMBLE, captures per-run metrics including
 # task_type, and appends one row to the runs.jsonl ledger.
 #
-# Usage:
-#   sme-ab-run --spec PATH --task-type TYPE --sme-mode {on|off}
-#              [--repo-id ID] [--out PATH] [--max-tokens N]
-#              [--auto-claude PATH]
+# Single-mode (default):
+#   sme-ab-run --spec PATH --sme-mode {on|off} [--task-type TYPE]
+#   Runs auto_claude once. If --task-type is omitted, sme-classify-task
+#   auto-classifies and records the rationale.
 #
-#   --spec       path to the auto_claude spec.md
-#   --task-type  one of: feature bugfix refactor greenfield new-pattern
-#                        cross-cutting other
-#   --sme-mode   on  → run sme-prompt-context, set preamble env var
-#                off → run auto_claude with no preamble (control)
-#   --repo-id    SME repo id (default: derived from cwd's git remote)
-#   --out        runs.jsonl path (default: ~/.claude-pipeline/ab-runs/runs.jsonl)
-#   --max-tokens preamble cap when --sme-mode on (default: 2000)
-#   --auto-claude path to the auto_claude binary (default: ~/bin/auto_claude)
+# Paired-parallel (opt-in, deliberate):
+#   sme-ab-run --spec PATH --paired [--task-type TYPE]
+#   Forks TWO parallel runs in fresh git worktrees from the same baseline:
+#   one with sme-mode=off, one with sme-mode=on. Both rows share a pair_id
+#   so the reporter can identify paired observations. You inspect the two
+#   worktrees afterwards and merge whichever you prefer.
+#
+# Common flags:
+#   --task-type TYPE    one of: feature bugfix refactor greenfield
+#                       new-pattern cross-cutting other.
+#                       Omit to auto-classify (recommended).
+#   --override-auto     when --task-type is also given, records that the
+#                       human disagreed with auto-classification.
+#   --repo-id ID        SME repo id (default: derived from cwd's git remote)
+#   --out PATH          runs.jsonl (default: ~/.claude-pipeline/ab-runs/runs.jsonl)
+#   --max-tokens N      preamble cap when --sme-mode on (default: 2000)
+#   --auto-claude PATH  auto_claude binary (default: ~/bin/auto_claude)
 #
 # Exit code mirrors auto_claude's. The metrics row is appended even on
-# failure so the ledger captures the failure case too.
+# failure so the ledger captures both success and failure cases.
 
 set -Eeuo pipefail
 
@@ -33,6 +41,8 @@ VALID_TASK_TYPES="feature bugfix refactor greenfield new-pattern cross-cutting o
 SPEC=""
 TASK_TYPE=""
 SME_MODE=""
+PAIRED=false
+OVERRIDE_AUTO=false
 REPO_ID=""
 OUT_FILE=""
 MAX_TOKENS="2000"
@@ -40,43 +50,51 @@ AUTO_CLAUDE_BIN="$HOME/bin/auto_claude"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --spec)        SPEC="${2:?--spec needs value}"; shift 2 ;;
-    --task-type)   TASK_TYPE="${2:?--task-type needs value}"; shift 2 ;;
-    --sme-mode)    SME_MODE="${2:?--sme-mode needs value}"; shift 2 ;;
-    --repo-id)     REPO_ID="${2:?--repo-id needs value}"; shift 2 ;;
-    --out)         OUT_FILE="${2:?--out needs value}"; shift 2 ;;
-    --max-tokens)  MAX_TOKENS="${2:?--max-tokens needs value}"; shift 2 ;;
-    --auto-claude) AUTO_CLAUDE_BIN="${2:?--auto-claude needs value}"; shift 2 ;;
-    -h|--help) sed -n '/^# Usage:/,/^# Exit/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    --spec)          SPEC="${2:?--spec needs value}"; shift 2 ;;
+    --task-type)     TASK_TYPE="${2:?--task-type needs value}"; shift 2 ;;
+    --sme-mode)      SME_MODE="${2:?--sme-mode needs value}"; shift 2 ;;
+    --paired)        PAIRED=true; shift ;;
+    --override-auto) OVERRIDE_AUTO=true; shift ;;
+    --repo-id)       REPO_ID="${2:?--repo-id needs value}"; shift 2 ;;
+    --out)           OUT_FILE="${2:?--out needs value}"; shift 2 ;;
+    --max-tokens)    MAX_TOKENS="${2:?--max-tokens needs value}"; shift 2 ;;
+    --auto-claude)   AUTO_CLAUDE_BIN="${2:?--auto-claude needs value}"; shift 2 ;;
+    -h|--help) sed -n '/^# Single-mode/,/^# Exit/p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) _die "unknown arg: $1" ;;
   esac
 done
 
-[[ -n "$SPEC" ]]      || _die "--spec is required"
-[[ -n "$TASK_TYPE" ]] || _die "--task-type is required"
-[[ -n "$SME_MODE" ]]  || _die "--sme-mode is required"
+[[ -n "$SPEC" ]] || _die "--spec is required"
 
-case " $VALID_TASK_TYPES " in
-  *" $TASK_TYPE "*) ;;
-  *) _die "task_type must be one of: $VALID_TASK_TYPES (got: $TASK_TYPE)" ;;
-esac
+# Mode validation: --paired XOR --sme-mode
+if [[ "$PAIRED" = true ]]; then
+  [[ -z "$SME_MODE" ]] || _die "--paired and --sme-mode are mutually exclusive"
+else
+  [[ -n "$SME_MODE" ]] || _die "either --sme-mode {on|off} or --paired is required"
+  [[ "$SME_MODE" = "on" || "$SME_MODE" = "off" ]] \
+    || _die "sme-mode must be 'on' or 'off' (got: $SME_MODE)"
+fi
 
-[[ "$SME_MODE" = "on" || "$SME_MODE" = "off" ]] \
-  || _die "sme-mode must be 'on' or 'off' (got: $SME_MODE)"
+# Task-type validation (if explicit)
+if [[ -n "$TASK_TYPE" ]]; then
+  case " $VALID_TASK_TYPES " in
+    *" $TASK_TYPE "*) ;;
+    *) _die "task_type must be one of: $VALID_TASK_TYPES (got: $TASK_TYPE)" ;;
+  esac
+fi
 
 [[ -f "$SPEC" ]] || _die "spec not found: $SPEC"
 [[ -x "$AUTO_CLAUDE_BIN" ]] || _die "auto_claude binary not found or not executable: $AUTO_CLAUDE_BIN"
 
-# Resolve to absolute paths
 SPEC=$(cd "$(dirname "$SPEC")" && pwd)/$(basename "$SPEC")
+BIN_DIR="$(dirname "$AUTO_CLAUDE_BIN")"
 
 # ─── Resolve repo_id (cwd-relative if not given) ─────────────────────────────
 if [[ -z "$REPO_ID" ]]; then
   remote=$(git -C "$(dirname "$SPEC")" remote get-url origin 2>/dev/null \
     || git remote get-url origin 2>/dev/null || true)
   if [[ -n "$remote" ]]; then
-    remote="${remote%.git}"
-    remote="${remote%/}"
+    remote="${remote%.git}"; remote="${remote%/}"
     if [[ "$remote" =~ :([^/]+)/([^/]+)$ ]]; then
       REPO_ID="${BASH_REMATCH[1]}__${BASH_REMATCH[2]}"
     elif [[ "$remote" =~ /([^/]+)/([^/]+)$ ]]; then
@@ -86,113 +104,211 @@ if [[ -z "$REPO_ID" ]]; then
   [[ -n "$REPO_ID" ]] || _die "could not derive --repo-id; pass it explicitly"
 fi
 
-# ─── Output path ─────────────────────────────────────────────────────────────
 [[ -z "$OUT_FILE" ]] && OUT_FILE="$HOME/.claude-pipeline/ab-runs/runs.jsonl"
 mkdir -p "$(dirname "$OUT_FILE")"
 touch "$OUT_FILE"
 
-# ─── SME priming ─────────────────────────────────────────────────────────────
-PREAMBLE=""
-PREAMBLE_SIZE_CHARS=0
-if [[ "$SME_MODE" = "on" ]]; then
-  CTX_BIN="$(dirname "$AUTO_CLAUDE_BIN")/sme-prompt-context"
-  [[ -x "$CTX_BIN" ]] || _die "sme-prompt-context not found at $CTX_BIN"
-  PREAMBLE=$("$CTX_BIN" --repo-id "$REPO_ID" --spec "$SPEC" --max-tokens "$MAX_TOKENS")
-  PREAMBLE_SIZE_CHARS=${#PREAMBLE}
+# ─── Resolve task_type (auto-classify if absent) ─────────────────────────────
+TASK_TYPE_SOURCE=""
+TASK_TYPE_RATIONALE=""
+
+if [[ -z "$TASK_TYPE" ]]; then
+  CLASSIFY_BIN="$BIN_DIR/sme-classify-task"
+  [[ -x "$CLASSIFY_BIN" ]] || _die "sme-classify-task not found at $CLASSIFY_BIN"
+  classify_json=$("$CLASSIFY_BIN" --spec "$SPEC")
+  TASK_TYPE=$(echo "$classify_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["task_type"])')
+  TASK_TYPE_SOURCE="auto"
+  TASK_TYPE_RATIONALE=$(echo "$classify_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["task_type_rationale"])')
+elif [[ "$OVERRIDE_AUTO" = true ]]; then
+  CLASSIFY_BIN="$BIN_DIR/sme-classify-task"
+  if [[ -x "$CLASSIFY_BIN" ]]; then
+    classify_json=$("$CLASSIFY_BIN" --spec "$SPEC" 2>/dev/null || echo '{}')
+    auto_pick=$(echo "$classify_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("task_type",""))' 2>/dev/null || echo "")
+    TASK_TYPE_SOURCE="manual-override"
+    TASK_TYPE_RATIONALE="manual override of auto-classifier (auto picked: ${auto_pick:-unknown})"
+  else
+    TASK_TYPE_SOURCE="manual-override"
+    TASK_TYPE_RATIONALE="manual override; auto-classifier not available"
+  fi
+else
+  TASK_TYPE_SOURCE="manual"
+  TASK_TYPE_RATIONALE="task_type passed explicitly via --task-type"
 fi
 
-# ─── Run ─────────────────────────────────────────────────────────────────────
-RUN_ID=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
-STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-START_EPOCH=$(date +%s)
-
-# Capture baseline diff state — we'll diff against this at the end
+# ─── Capture baseline before any run starts ──────────────────────────────────
 PROJECT_ROOT=$(cd "$(dirname "$SPEC")" && git rev-parse --show-toplevel 2>/dev/null || echo "")
 BASELINE_SHA=""
 if [[ -n "$PROJECT_ROOT" ]]; then
   BASELINE_SHA=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")
 fi
 
-set +e
-if [[ "$SME_MODE" = "on" ]]; then
-  AUTO_CLAUDE_PROMPT_PREAMBLE="$PREAMBLE" "$AUTO_CLAUDE_BIN" "$SPEC"
-else
-  unset AUTO_CLAUDE_PROMPT_PREAMBLE
-  "$AUTO_CLAUDE_BIN" "$SPEC"
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+# Build the sme-on preamble for a given repo+spec; echoes to stdout.
+_build_preamble() {
+  local CTX_BIN="$BIN_DIR/sme-prompt-context"
+  [[ -x "$CTX_BIN" ]] || _die "sme-prompt-context not found at $CTX_BIN"
+  "$CTX_BIN" --repo-id "$REPO_ID" --spec "$SPEC" --max-tokens "$MAX_TOKENS"
+}
+
+# _run_one — Execute auto_claude in a working directory and append a row.
+#
+# Args:
+#   $1 = mode (on|off)
+#   $2 = working directory (project root for single-mode, worktree for paired)
+#   $3 = pair_id ("" for single-mode, uuid for paired)
+#
+# Side effect: appends one row to OUT_FILE.
+# Echoes summary to stderr.
+_run_one() {
+  local mode="$1" workdir="$2" pair_id="$3"
+  local run_id started_at start_epoch finished_at end_epoch duration
+  local exit_code outcome preamble preamble_chars=0
+  local phases_completed=0 final_sha=""
+  local diff_added=0 diff_removed=0
+
+  run_id=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
+  started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  start_epoch=$(date +%s)
+
+  if [[ "$mode" = "on" ]]; then
+    preamble=$(_build_preamble)
+    preamble_chars=${#preamble}
+  else
+    preamble=""
+  fi
+
+  set +e
+  if [[ "$mode" = "on" ]]; then
+    ( cd "$workdir" && AUTO_CLAUDE_PROMPT_PREAMBLE="$preamble" "$AUTO_CLAUDE_BIN" "$SPEC" )
+  else
+    ( cd "$workdir" && unset AUTO_CLAUDE_PROMPT_PREAMBLE && "$AUTO_CLAUDE_BIN" "$SPEC" )
+  fi
+  exit_code=$?
+  set -e
+
+  finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  end_epoch=$(date +%s)
+  duration=$((end_epoch - start_epoch))
+  outcome=$([ "$exit_code" -eq 0 ] && echo "success" || echo "failed")
+
+  local state_file="$workdir/.auto_claude_state.json"
+  if [[ -f "$state_file" ]]; then
+    phases_completed=$(jq '[.phases | to_entries[] | select(.value.status == "completed")] | length' "$state_file" 2>/dev/null || echo 0)
+  fi
+
+  if [[ -d "$workdir/.git" ]] || git -C "$workdir" rev-parse --git-dir >/dev/null 2>&1; then
+    final_sha=$(git -C "$workdir" rev-parse HEAD 2>/dev/null || echo "")
+    if [[ -n "$final_sha" && -n "$BASELINE_SHA" ]]; then
+      local stats
+      stats=$(git -C "$workdir" diff --shortstat "$BASELINE_SHA" "$final_sha" 2>/dev/null || echo "")
+      diff_added=$(echo "$stats" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)
+      diff_removed=$(echo "$stats" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)
+      [[ -z "$diff_added" ]] && diff_added=0
+      [[ -z "$diff_removed" ]] && diff_removed=0
+    fi
+  fi
+
+  jq -nc \
+    --arg run_id "$run_id" \
+    --arg spec "$SPEC" \
+    --arg repo_id "$REPO_ID" \
+    --arg task_type "$TASK_TYPE" \
+    --arg task_type_source "$TASK_TYPE_SOURCE" \
+    --arg task_type_rationale "$TASK_TYPE_RATIONALE" \
+    --arg sme_mode "$mode" \
+    --arg pair_id "$pair_id" \
+    --arg started_at "$started_at" \
+    --arg finished_at "$finished_at" \
+    --arg duration "$duration" \
+    --arg outcome "$outcome" \
+    --arg exit_code "$exit_code" \
+    --arg phases "$phases_completed" \
+    --arg added "$diff_added" \
+    --arg removed "$diff_removed" \
+    --arg baseline "$BASELINE_SHA" \
+    --arg final "$final_sha" \
+    --arg preamble_size "$preamble_chars" \
+    --arg worktree_path "$workdir" \
+    '{
+      run_id: $run_id,
+      spec: $spec,
+      repo_id: $repo_id,
+      task_type: $task_type,
+      task_type_source: $task_type_source,
+      task_type_rationale: $task_type_rationale,
+      sme_mode: $sme_mode,
+      pair_id: (if $pair_id == "" then null else $pair_id end),
+      started_at: $started_at,
+      finished_at: $finished_at,
+      duration_seconds: ($duration | tonumber),
+      outcome: $outcome,
+      exit_code: ($exit_code | tonumber),
+      phases_completed: ($phases | tonumber),
+      git_diff_added: ($added | tonumber),
+      git_diff_removed: ($removed | tonumber),
+      baseline_sha: $baseline,
+      final_sha: $final,
+      preamble_size_chars: ($preamble_size | tonumber),
+      worktree_path: $worktree_path,
+      review_score: null
+    }' >> "$OUT_FILE"
+
+  echo "[sme-ab-run] mode=$mode run_id=$run_id outcome=$outcome duration=${duration}s workdir=$workdir" >&2
+  return "$exit_code"
+}
+
+# ─── Main: single-mode or paired-parallel ────────────────────────────────────
+
+if [[ "$PAIRED" = false ]]; then
+  # Single-mode: run in $PROJECT_ROOT (or cwd if no project root)
+  WORKDIR="${PROJECT_ROOT:-$(pwd)}"
+  set +e
+  _run_one "$SME_MODE" "$WORKDIR" ""
+  EXIT_CODE=$?
+  set -e
+  echo "[sme-ab-run] task_type=$TASK_TYPE (source=$TASK_TYPE_SOURCE)" >&2
+  echo "[sme-ab-run] appended to $OUT_FILE" >&2
+  exit "$EXIT_CODE"
 fi
-EXIT_CODE=$?
+
+# Paired-parallel: two worktrees from same baseline, both run in parallel
+[[ -n "$PROJECT_ROOT" ]] || _die "--paired requires the spec to be inside a git repo"
+[[ -n "$BASELINE_SHA" ]] || _die "--paired requires a non-empty git history (baseline_sha)"
+
+PAIR_ID=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
+WT_BASE="$HOME/.claude-pipeline/worktrees"
+mkdir -p "$WT_BASE"
+WT_OFF="$WT_BASE/${PAIR_ID}-off"
+WT_ON="$WT_BASE/${PAIR_ID}-on"
+
+# Create both worktrees from the same baseline_sha
+git -C "$PROJECT_ROOT" worktree add --detach "$WT_OFF" "$BASELINE_SHA" >&2
+git -C "$PROJECT_ROOT" worktree add --detach "$WT_ON"  "$BASELINE_SHA" >&2
+
+echo "[sme-ab-run] paired pair_id=$PAIR_ID" >&2
+echo "[sme-ab-run]   off-worktree: $WT_OFF" >&2
+echo "[sme-ab-run]   on-worktree:  $WT_ON" >&2
+echo "[sme-ab-run]   task_type=$TASK_TYPE (source=$TASK_TYPE_SOURCE)" >&2
+
+set +e
+_run_one off "$WT_OFF" "$PAIR_ID" &
+PID_OFF=$!
+_run_one on  "$WT_ON"  "$PAIR_ID" &
+PID_ON=$!
+wait "$PID_OFF"; EXIT_OFF=$?
+wait "$PID_ON";  EXIT_ON=$?
 set -e
 
-FINISHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-END_EPOCH=$(date +%s)
-DURATION=$((END_EPOCH - START_EPOCH))
-
-# ─── Capture metrics ─────────────────────────────────────────────────────────
-OUTCOME=$([ "$EXIT_CODE" -eq 0 ] && echo "success" || echo "failed")
-
-PHASES_COMPLETED=0
-STATE_FILE=""
-if [[ -n "$PROJECT_ROOT" ]]; then
-  STATE_FILE="$PROJECT_ROOT/.auto_claude_state.json"
-  if [[ -f "$STATE_FILE" ]]; then
-    PHASES_COMPLETED=$(jq '[.phases | to_entries[] | select(.value.status == "completed")] | length' "$STATE_FILE" 2>/dev/null || echo 0)
-  fi
-fi
-
-DIFF_ADDED=0
-DIFF_REMOVED=0
-FINAL_SHA=""
-if [[ -n "$PROJECT_ROOT" && -n "$BASELINE_SHA" ]]; then
-  FINAL_SHA=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")
-  if [[ -n "$FINAL_SHA" ]]; then
-    diff_stats=$(git -C "$PROJECT_ROOT" diff --shortstat "$BASELINE_SHA" "$FINAL_SHA" 2>/dev/null || echo "")
-    DIFF_ADDED=$(echo "$diff_stats" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)
-    DIFF_REMOVED=$(echo "$diff_stats" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)
-    [[ -z "$DIFF_ADDED" ]] && DIFF_ADDED=0
-    [[ -z "$DIFF_REMOVED" ]] && DIFF_REMOVED=0
-  fi
-fi
-
-# ─── Append row ──────────────────────────────────────────────────────────────
-jq -nc \
-  --arg run_id "$RUN_ID" \
-  --arg spec "$SPEC" \
-  --arg repo_id "$REPO_ID" \
-  --arg task_type "$TASK_TYPE" \
-  --arg sme_mode "$SME_MODE" \
-  --arg started_at "$STARTED_AT" \
-  --arg finished_at "$FINISHED_AT" \
-  --arg duration "$DURATION" \
-  --arg outcome "$OUTCOME" \
-  --arg exit_code "$EXIT_CODE" \
-  --arg phases "$PHASES_COMPLETED" \
-  --arg added "$DIFF_ADDED" \
-  --arg removed "$DIFF_REMOVED" \
-  --arg baseline "$BASELINE_SHA" \
-  --arg final "$FINAL_SHA" \
-  --arg preamble_size "$PREAMBLE_SIZE_CHARS" \
-  '{
-    run_id: $run_id,
-    spec: $spec,
-    repo_id: $repo_id,
-    task_type: $task_type,
-    sme_mode: $sme_mode,
-    started_at: $started_at,
-    finished_at: $finished_at,
-    duration_seconds: ($duration | tonumber),
-    outcome: $outcome,
-    exit_code: ($exit_code | tonumber),
-    phases_completed: ($phases | tonumber),
-    git_diff_added: ($added | tonumber),
-    git_diff_removed: ($removed | tonumber),
-    baseline_sha: $baseline,
-    final_sha: $final,
-    preamble_size_chars: ($preamble_size | tonumber),
-    review_score: null
-  }' >> "$OUT_FILE"
-
 echo "" >&2
-echo "[sme-ab-run] run_id=$RUN_ID outcome=$OUTCOME duration=${DURATION}s sme_mode=$SME_MODE task_type=$TASK_TYPE" >&2
-echo "[sme-ab-run] appended to $OUT_FILE" >&2
+echo "[sme-ab-run] paired complete: off=$EXIT_OFF on=$EXIT_ON" >&2
+echo "[sme-ab-run] inspect both worktrees and merge whichever you prefer" >&2
+echo "[sme-ab-run]   git -C $WT_OFF diff $BASELINE_SHA" >&2
+echo "[sme-ab-run]   git -C $WT_ON  diff $BASELINE_SHA" >&2
+echo "[sme-ab-run] when done: git -C $PROJECT_ROOT worktree remove $WT_OFF $WT_ON" >&2
 
-exit "$EXIT_CODE"
+# Exit non-zero if either run failed
+if [[ "$EXIT_OFF" -ne 0 || "$EXIT_ON" -ne 0 ]]; then
+  exit 1
+fi
+exit 0
