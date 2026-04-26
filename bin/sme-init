@@ -1,0 +1,138 @@
+#!/bin/bash
+# sme-init — Bootstrap minimum SME from existing reposAnalyser artifacts.
+#
+# Creates ~/.claude-pipeline/repos/<owner>__<repo>/sme/ with:
+#   recovery/   -> symlink to <repo>/.recovery_artifacts/
+#   handoffs/   -> symlink to <repo>/.phase_handoffs/
+#   journal/    -> empty tickets.jsonl, gotchas.jsonl
+#   digest.md   -> generated bibliography (regenerable)
+#
+# Usage: sme-init <repo-path>
+#
+# Refuses to run if <repo-path>/.recovery_artifacts/ is missing — run
+# reposAnalyser on the repo first.
+#
+# Idempotent. Re-running updates digest.md and re-asserts symlinks.
+
+set -Eeuo pipefail
+
+_die() { echo "ERROR: $*" >&2; exit 1; }
+
+REPO_PATH="${1:?Usage: sme-init <repo-path>}"
+
+# Resolve to absolute path
+if [[ "$REPO_PATH" != /* ]]; then
+  REPO_PATH="$(cd "$REPO_PATH" 2>/dev/null && pwd)" || _die "repo path not found: $1"
+fi
+[[ -d "$REPO_PATH" ]] || _die "not a directory: $REPO_PATH"
+
+RECOVERY_DIR="$REPO_PATH/.recovery_artifacts"
+HANDOFFS_DIR="$REPO_PATH/.phase_handoffs"
+
+[[ -d "$RECOVERY_DIR" ]] || _die "no .recovery_artifacts/ in $REPO_PATH — run reposAnalyser first"
+
+# Resolve owner__repo identifier
+_resolve_repo_id() {
+  local remote owner repo
+  remote=$(git -C "$REPO_PATH" remote get-url origin 2>/dev/null || true)
+  if [[ -n "$remote" ]]; then
+    # Strip .git suffix, trailing slash; handle ssh and https forms
+    remote="${remote%.git}"
+    remote="${remote%/}"
+    # ssh form: git@host:owner/repo
+    if [[ "$remote" =~ :([^/]+)/([^/]+)$ ]]; then
+      owner="${BASH_REMATCH[1]}"; repo="${BASH_REMATCH[2]}"
+    # https form: https://host/owner/repo
+    elif [[ "$remote" =~ /([^/]+)/([^/]+)$ ]]; then
+      owner="${BASH_REMATCH[1]}"; repo="${BASH_REMATCH[2]}"
+    fi
+  fi
+  if [[ -z "${owner:-}" || -z "${repo:-}" ]]; then
+    # Fallback: parent-dir-name__basename
+    owner=$(basename "$(dirname "$REPO_PATH")")
+    repo=$(basename "$REPO_PATH")
+  fi
+  echo "${owner}__${repo}"
+}
+
+REPO_ID=$(_resolve_repo_id)
+SME_ROOT="$HOME/.claude-pipeline/repos/$REPO_ID/sme"
+
+mkdir -p "$SME_ROOT/journal"
+
+# Symlinks (replace if existing target differs)
+_symlink() {
+  local target="$1" link="$2"
+  if [[ -L "$link" ]]; then
+    [[ "$(readlink "$link")" = "$target" ]] && return 0
+    rm "$link"
+  elif [[ -e "$link" ]]; then
+    _die "$link exists and is not a symlink — refusing to overwrite"
+  fi
+  ln -s "$target" "$link"
+}
+
+_symlink "$RECOVERY_DIR" "$SME_ROOT/recovery"
+[[ -d "$HANDOFFS_DIR" ]] && _symlink "$HANDOFFS_DIR" "$SME_ROOT/handoffs"
+
+# Journal files (create empty if absent; never overwrite)
+[[ -e "$SME_ROOT/journal/tickets.jsonl" ]] || : > "$SME_ROOT/journal/tickets.jsonl"
+[[ -e "$SME_ROOT/journal/gotchas.jsonl" ]] || : > "$SME_ROOT/journal/gotchas.jsonl"
+
+# Generate digest.md — bibliography of what's available
+_generate_digest() {
+  local digest="$SME_ROOT/digest.md"
+  {
+    echo "# SME digest — $REPO_ID"
+    echo
+    echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "Source repo: \`$REPO_PATH\`"
+    echo
+    echo "## SME priming (verify before relying)"
+    echo
+    echo "The artifacts below come from reposAnalyser recovery — they describe"
+    echo "what the codebase looked like at recovery time. Always verify any"
+    echo "specific claim against current source before acting on it."
+    echo
+    echo "## Recovery artifacts"
+    echo
+    if [[ -d "$RECOVERY_DIR" ]]; then
+      printf "| Artifact | Size | Last modified |\n"
+      printf "|---|---|---|\n"
+      while IFS= read -r f; do
+        [[ -f "$f" ]] || continue
+        local name size mtime
+        name=$(basename "$f")
+        size=$(wc -c < "$f" | tr -d ' ')
+        # Cross-platform mtime: try GNU stat first, fall back to BSD stat
+        mtime=$(stat -c %y "$f" 2>/dev/null | cut -d'.' -f1 || stat -f %Sm -t '%Y-%m-%d %H:%M:%S' "$f" 2>/dev/null || echo "unknown")
+        printf "| \`%s\` | %s bytes | %s |\n" "$name" "$size" "$mtime"
+      done < <(find "$RECOVERY_DIR" -maxdepth 1 -type f -name '*.json' | sort)
+    fi
+    echo
+    if [[ -d "$HANDOFFS_DIR" ]]; then
+      echo "## Phase handoffs"
+      echo
+      printf "| Handoff |\n|---|\n"
+      while IFS= read -r f; do
+        [[ -f "$f" ]] || continue
+        printf "| \`%s\` |\n" "$(basename "$f")"
+      done < <(find "$HANDOFFS_DIR" -maxdepth 1 -type f -name '*.json' | sort)
+      echo
+    fi
+    echo "## Journal"
+    echo
+    local tickets gotchas
+    tickets=$(wc -l < "$SME_ROOT/journal/tickets.jsonl" | tr -d ' ')
+    gotchas=$(wc -l < "$SME_ROOT/journal/gotchas.jsonl" | tr -d ' ')
+    echo "- Tickets: $tickets entries"
+    echo "- Gotchas: $gotchas entries"
+  } > "$digest"
+}
+
+_generate_digest
+
+echo "Initialised SME at $SME_ROOT"
+echo "  repo:     $REPO_PATH"
+echo "  repo_id:  $REPO_ID"
+echo "  digest:   $SME_ROOT/digest.md"

@@ -19,19 +19,21 @@ BINDIR  := $(PREFIX)/bin
 
 LDFLAGS := -s -w
 
-.PHONY: all build install test vet check build-all clean help
+.PHONY: all build install install-bash test test-bash vet check build-all clean help
 
 all: build
 
 help:
 	@echo "Targets:"
-	@echo "  build       - build $(BINARY) for host OS/arch ($(DIST)/$(BINARY))"
-	@echo "  install     - build and copy to $(BINDIR)/$(BINARY)"
-	@echo "  test        - go test ./helper/..."
-	@echo "  vet         - go vet ./helper/..."
-	@echo "  check       - vet + test"
-	@echo "  build-all   - cross-compile for darwin/linux × arm64/amd64 into $(DIST)/"
-	@echo "  clean       - remove $(DIST)/"
+	@echo "  build         - build $(BINARY) for host OS/arch ($(DIST)/$(BINARY))"
+	@echo "  install       - build and copy ac-helper to $(BINDIR)/$(BINARY)"
+	@echo "  install-bash  - copy bash binaries (auto_claude, worktree_auto_claude, sme-*) to $(BINDIR)"
+	@echo "  test          - go test ./helper/..."
+	@echo "  test-bash     - run shell tests in tests/"
+	@echo "  vet           - go vet ./helper/..."
+	@echo "  check         - vet + test"
+	@echo "  build-all     - cross-compile for darwin/linux × arm64/amd64 into $(DIST)/"
+	@echo "  clean         - remove $(DIST)/"
 
 build: | $(DIST)
 	cd helper && $(GO) build -ldflags '$(LDFLAGS)' -o ../$(DIST)/$(BINARY) .
@@ -41,8 +43,26 @@ install: build
 	install -m 0755 $(DIST)/$(BINARY) $(BINDIR)/$(BINARY)
 	@echo "Installed $(BINDIR)/$(BINARY)"
 
+# Deploy the bash binaries (auto_claude, worktree_auto_claude, auto_claude_original,
+# and any sme-* harness scripts) from bin/ to $(BINDIR). Globs only what exists,
+# so it works incrementally as new sme-* scripts land.
+install-bash:
+	@mkdir -p $(BINDIR)
+	@for f in bin/auto_claude bin/worktree_auto_claude bin/auto_claude_original bin/sme-*; do \
+	  [ -f "$$f" ] || continue; \
+	  install -m 0755 "$$f" "$(BINDIR)/$$(basename $$f)"; \
+	  echo "Installed $(BINDIR)/$$(basename $$f)"; \
+	done
+
 test:
 	cd helper && $(GO) test ./...
+
+test-bash:
+	@for t in tests/test_*.sh; do \
+	  [ -f "$$t" ] || continue; \
+	  echo "→ $$t"; \
+	  bash "$$t" || exit 1; \
+	done
 
 vet:
 	cd helper && $(GO) vet ./...
