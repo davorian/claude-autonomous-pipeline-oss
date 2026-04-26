@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""
+sme-classify-task — Heuristic classifier that picks a task_type for a spec.
+
+Returns task_type + rationale via JSON to stdout. Used by sme-ab-run when
+--task-type is omitted, but also runnable standalone for debugging.
+
+Rules (priority order):
+    bugfix         — "fix" / "bug" / "defect" + an existing-file reference
+    refactor       — refactor / rename / extract / consolidate / clean up
+    new-pattern    — introduce + (pattern | convention | discipline)
+    cross-cutting  — ≥ 2 distinct repo names OR "across services" / "multi-repo"
+    greenfield     — "from scratch" / "new module" / no existing-file refs
+    feature        — default (none of the above triggered)
+
+Usage:
+    sme-classify-task --spec PATH                    # JSON to stdout
+    sme-classify-task --spec PATH --human            # human-readable summary
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass
+class Rule:
+    name: str          # task_type to assign on match
+    test: callable     # (text: str, hits: dict) -> bool
+    explain: str       # filled in by the test when it returns True
+
+
+# Repo names mentioned in any spec across multiverse — used to detect
+# cross-cutting work. Tunable by editing this list.
+KNOWN_REPOS = {
+    "user_home", "platform", "aurora", "client_xp", "client-xp",
+    "goals_service", "interaction_compiler", "reposAnalyser",
+}
+
+# A token looks like an existing file reference if it has a `.ext` suffix
+# common to source code, OR contains at least one slash with an alpha prefix.
+FILE_REF_RE = re.compile(
+    r"\b[\w./_-]*\.(?:ts|tsx|js|jsx|py|ex|exs|rb|go|rs|java|kt|cs|sql|md)\b"
+    r"|"
+    r"\b[a-z][\w_-]*(?:/[\w.-]+){1,}\b"
+)
+
+
+def find_keywords(text: str, words: list[str]) -> list[str]:
+    """Return which of words appear in text as whole tokens (case-insensitive)."""
+    found: list[str] = []
+    lower = text.lower()
+    for w in words:
+        if re.search(rf"\b{re.escape(w)}\b", lower):
+            found.append(w)
+    return found
+
+
+def file_refs(text: str) -> list[str]:
+    return FILE_REF_RE.findall(text)
+
+
+def repo_mentions(text: str) -> set[str]:
+    found: set[str] = set()
+    lower = text.lower()
+    for repo in KNOWN_REPOS:
+        if re.search(rf"\b{re.escape(repo.lower())}\b", lower):
+            found.add(repo)
+    return found
+
+
+def classify(text: str) -> dict:
+    """Apply rules in order; return {task_type, source, rationale}."""
+    # Rule 1: bugfix
+    bug_kws = find_keywords(text, ["fix", "bug", "defect", "broken", "regression"])
+    refs = file_refs(text)
+    if bug_kws and refs:
+        return {
+            "task_type": "bugfix",
+            "task_type_source": "auto",
+            "task_type_rationale": (
+                f"matched 'bugfix': keywords {bug_kws}; "
+                f"references {len(refs)} existing file(s) e.g. {refs[0]}"
+            ),
+        }
+
+    # Rule 2: refactor
+    refactor_kws = find_keywords(
+        text, ["refactor", "rename", "extract", "consolidate", "deduplicate", "cleanup", "clean-up"]
+    )
+    if refactor_kws:
+        return {
+            "task_type": "refactor",
+            "task_type_source": "auto",
+            "task_type_rationale": f"matched 'refactor': keywords {refactor_kws}",
+        }
+
+    # Rule 3: new-pattern
+    intro_kws = find_keywords(text, ["introduce", "establish", "adopt"])
+    pattern_kws = find_keywords(text, ["pattern", "convention", "discipline", "standard"])
+    if intro_kws and pattern_kws:
+        return {
+            "task_type": "new-pattern",
+            "task_type_source": "auto",
+            "task_type_rationale": (
+                f"matched 'new-pattern': intro keywords {intro_kws}; "
+                f"pattern keywords {pattern_kws}"
+            ),
+        }
+
+    # Rule 4: cross-cutting
+    repos = repo_mentions(text)
+    cross_kws = find_keywords(text, ["across services", "multi-repo", "cross-service"])
+    if len(repos) >= 2 or cross_kws:
+        rationale = (
+            f"matched 'cross-cutting': "
+            + (f"mentions {sorted(repos)}" if len(repos) >= 2 else "")
+            + (f"; phrases {cross_kws}" if cross_kws else "")
+        )
+        return {
+            "task_type": "cross-cutting",
+            "task_type_source": "auto",
+            "task_type_rationale": rationale,
+        }
+
+    # Rule 5: greenfield
+    green_kws = find_keywords(text, ["from scratch", "new module", "greenfield"])
+    if green_kws or (not refs and len(text) > 100):
+        if not refs:
+            return {
+                "task_type": "greenfield",
+                "task_type_source": "auto",
+                "task_type_rationale": (
+                    "matched 'greenfield': no existing-file references found"
+                    + (f"; keywords {green_kws}" if green_kws else " in spec")
+                ),
+            }
+        return {
+            "task_type": "greenfield",
+            "task_type_source": "auto",
+            "task_type_rationale": f"matched 'greenfield': keywords {green_kws}",
+        }
+
+    # Default: feature
+    return {
+        "task_type": "feature",
+        "task_type_source": "auto",
+        "task_type_rationale": "no specific rule fired — defaulted to 'feature'",
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--spec", required=True, type=Path)
+    ap.add_argument("--human", action="store_true",
+                    help="human-readable output instead of JSON")
+    args = ap.parse_args()
+
+    if not args.spec.is_file():
+        print(f"ERROR: spec not found: {args.spec}", file=sys.stderr)
+        return 1
+
+    text = args.spec.read_text()
+    result = classify(text)
+
+    if args.human:
+        print(f"task_type: {result['task_type']}")
+        print(f"  reason: {result['task_type_rationale']}")
+    else:
+        print(json.dumps(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
