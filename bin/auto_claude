@@ -738,10 +738,29 @@ _tier_for_iteration() {
 #
 # run_claude_fresh — Starts a new conversation (for quality phases).
 
+# _build_full_prompt — Assemble the full prompt sent to claude.
+#   Prepends AUTO_CLAUDE_PROMPT_PREAMBLE (if set and non-empty) followed by
+#   a blank line, then the phase prompt, then NO_QUESTIONS. When the env
+#   var is unset or empty, output is byte-identical to the pre-preamble
+#   "${prompt} ${NO_QUESTIONS}" form — full backwards compatibility.
+#
+#   Used by sme-ab-run to inject SME priming context without modifying
+#   any phase prompt directly.
+_build_full_prompt() {
+  local prompt="$1"
+  local preamble="${AUTO_CLAUDE_PROMPT_PREAMBLE:-}"
+  if [ -n "$preamble" ]; then
+    printf '%s\n\n%s %s' "$preamble" "$prompt" "${NO_QUESTIONS}"
+  else
+    printf '%s %s' "$prompt" "${NO_QUESTIONS}"
+  fi
+}
+
 _invoke_claude() {
   local prompt="$1"
   shift
-  local full_prompt="${prompt} ${NO_QUESTIONS}"
+  local full_prompt
+  full_prompt=$(_build_full_prompt "$prompt")
 
   # --dangerously-skip-permissions is required because the pipeline is autonomous.
   # Without it, claude prompts for tool approval, but since output is captured
