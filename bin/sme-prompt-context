@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+sme-prompt-context — Slice SME content for prompt injection.
+
+Reads the SME for a repo, extracts terms from a spec, returns a markdown
+block of relevant invariants/policies/intents/contracts ranked by term
+overlap. Capped at --max-tokens (rough 4-chars-per-token estimate).
+
+Output is intended for AUTO_CLAUDE_PROMPT_PREAMBLE — emits a "verify
+before relying" header so phases treat the content as priming, not as
+ground truth.
+
+Usage:
+    sme-prompt-context --repo-id <owner__repo> --spec <path-to-spec.md>
+                       [--max-tokens N]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+# Approximate chars per token for budget estimation (Claude tokenizer is ~4
+# chars/token on English prose; we round down for a safety margin).
+CHARS_PER_TOKEN = 4
+
+# Header that marks the priming surface — matches the SME design contract.
+PRIMING_HEADER = (
+    "## SME priming (verify before relying)\n\n"
+    "The facts below were recovered from the codebase at recovery time. "
+    "Each may have moved or changed since. Verify against current source "
+    "before acting on any specific claim.\n"
+)
+
+
+def die(msg: str) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def extract_terms(spec_text: str) -> set[str]:
+    """Pull file paths and identifier-shaped tokens out of a spec.
+
+    Returns a flat set of normalized terms (lowercased). File paths kept
+    as-is (case-sensitive on disk); identifiers lowercased for matching
+    against snake_case-heavy recovery fields.
+    """
+    terms: set[str] = set()
+
+    # File paths: tokens with at least one slash or a recognisable extension
+    for m in re.finditer(r"`?\b([\w./_-]+\.\w{1,8})\b`?", spec_text):
+        terms.add(m.group(1))
+    for m in re.finditer(r"\b([a-z][\w]*(?:/[\w.-]+){1,})\b", spec_text):
+        terms.add(m.group(1))
+
+    # Identifiers: CamelCase, snake_case, kebab-case (length > 3 to skip noise)
+    for m in re.finditer(r"\b([A-Z][a-zA-Z0-9]{3,})\b", spec_text):
+        terms.add(m.group(1).lower())
+    for m in re.finditer(r"\b([a-z][a-z0-9_-]{3,}[a-z0-9])\b", spec_text):
+        tok = m.group(1)
+        # Skip very common English words that aren't useful as identifiers
+        if tok not in COMMON_WORDS:
+            terms.add(tok)
+
+    return terms
+
+
+COMMON_WORDS = {
+    "this", "that", "with", "from", "have", "will", "should", "would",
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "her",
+    "was", "one", "our", "out", "day", "get", "has", "him", "his", "how",
+    "man", "new", "now", "old", "see", "two", "way", "who", "boy", "did",
+    "its", "let", "put", "say", "she", "too", "use", "spec", "specs",
+    "context", "deliverable", "deliverables", "ticket", "tickets",
+    "section", "sections", "above", "below", "after", "before", "when",
+    "what", "which", "where", "while", "test", "tests", "file", "files",
+    "into", "over", "under", "than", "then", "into", "code", "task",
+    "must", "more", "less", "some", "many", "such", "case", "cases",
+    "claim", "claims", "verify", "ensure", "needs", "need", "want",
+}
+
+
+def fact_terms(fact: dict[str, Any], kind: str) -> set[str]:
+    """Extract searchable terms from a fact, depending on kind."""
+    terms: set[str] = set()
+
+    def add(v: Any) -> None:
+        if isinstance(v, str):
+            terms.add(v.lower())
+        elif isinstance(v, list):
+            for item in v:
+                add(item)
+
+    if kind == "invariant":
+        add(fact.get("related_subjects"))
+        add(fact.get("related_behaviours"))
+        add(fact.get("description"))
+        for ev in fact.get("evidence") or []:
+            add(ev.get("source"))
+    elif kind == "policy":
+        add(fact.get("applies_to"))
+        add(fact.get("derived_from"))
+        add(fact.get("name"))
+        add(fact.get("rule"))
+        for ev in fact.get("evidence") or []:
+            add(ev.get("source"))
+    elif kind == "intent":
+        add(fact.get("subject"))
+        add(fact.get("canonical_intent"))
+        add(fact.get("user_expression"))
+        add(fact.get("context_refs"))
+
+    return terms
+
+
+def overlap_score(spec_terms: set[str], fact_term_set: set[str]) -> int:
+    """Count exact-match and substring overlap between spec and fact terms."""
+    score = 0
+    for t in spec_terms:
+        for ft in fact_term_set:
+            if not ft:
+                continue
+            if t == ft:
+                score += 3
+            elif t in ft or ft in t:
+                score += 1
+    return score
+
+
+def load_json(path: Path, key: str) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        return data.get(key) or []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def format_invariant(inv: dict[str, Any]) -> str:
+    iid = inv.get("invariant_id", "?")
+    desc = (inv.get("description") or "").strip()
+    subjects = ", ".join(inv.get("related_subjects") or [])
+    confidence = inv.get("confidence")
+    parts = [f"- **`{iid}`**: {desc}"]
+    if subjects:
+        parts.append(f" (subjects: {subjects})")
+    if confidence is not None:
+        parts.append(f" (confidence at recovery: {confidence})")
+    return "".join(parts)
+
+
+def format_policy(pol: dict[str, Any]) -> str:
+    pid = pol.get("id", "?")
+    name = pol.get("name") or pol.get("type") or ""
+    rule = (pol.get("rule") or "").strip()
+    applies = ", ".join((pol.get("applies_to") or [])[:5])
+    head = f"- **`{pid}`**"
+    if name:
+        head += f" ({name})"
+    head += f": {rule}"
+    if applies:
+        head += f" — applies to: {applies}"
+    return head
+
+
+def format_intent(env: dict[str, Any]) -> str:
+    subj = env.get("subject", "?")
+    canon = (env.get("canonical_intent") or env.get("user_expression") or "").strip()
+    return f"- **{subj}**: {canon}"
+
+
+def slice_facts(
+    facts: list[dict[str, Any]],
+    kind: str,
+    spec_terms: set[str],
+    formatter,
+) -> list[tuple[int, str]]:
+    """Score, format, and rank facts by overlap with spec terms."""
+    scored: list[tuple[int, str]] = []
+    for f in facts:
+        score = overlap_score(spec_terms, fact_terms(f, kind))
+        if score > 0:
+            scored.append((score, formatter(f)))
+    scored.sort(key=lambda x: -x[0])
+    return scored
+
+
+def build_digest_fallback(sme_root: Path) -> str:
+    """When no terms match, return the static digest header summary."""
+    digest = sme_root / "digest.md"
+    if digest.is_file():
+        return digest.read_text()
+    return "(SME exists but has no digest yet — run sme-init)"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--repo-id", required=True)
+    ap.add_argument("--spec", required=True, type=Path)
+    ap.add_argument("--max-tokens", type=int, default=2000)
+    args = ap.parse_args()
+
+    sme_root = Path.home() / ".claude-pipeline" / "repos" / args.repo_id / "sme"
+    if not sme_root.is_dir():
+        die(f"SME not found for {args.repo_id} — run sme-init <repo-path> first")
+
+    if not args.spec.is_file():
+        die(f"spec not found: {args.spec}")
+
+    spec_text = args.spec.read_text()
+    spec_terms = extract_terms(spec_text)
+    if not spec_terms:
+        # Nothing to match — return digest fallback (capped)
+        digest = build_digest_fallback(sme_root)
+        budget = args.max_tokens * CHARS_PER_TOKEN
+        print(PRIMING_HEADER + "\n" + digest[:budget])
+        return 0
+
+    recovery = sme_root / "recovery"
+    invariants = load_json(recovery / "invariants.json", "invariants")
+    policies = load_json(recovery / "policies.json", "policies")
+    intents = load_json(recovery / "intent_envelopes.json", "intent_envelopes")
+
+    inv_lines = slice_facts(invariants, "invariant", spec_terms, format_invariant)
+    pol_lines = slice_facts(policies, "policy", spec_terms, format_policy)
+    int_lines = slice_facts(intents, "intent", spec_terms, format_intent)
+
+    budget_chars = args.max_tokens * CHARS_PER_TOKEN
+    used = len(PRIMING_HEADER)
+    sections: list[str] = [PRIMING_HEADER]
+
+    def take(header: str, lines: list[tuple[int, str]]) -> None:
+        nonlocal used
+        if not lines:
+            return
+        section = [f"\n### {header}\n"]
+        used += len(section[0])
+        for _, line in lines:
+            if used + len(line) + 1 > budget_chars:
+                break
+            section.append(line)
+            used += len(line) + 1
+        if len(section) > 1:
+            sections.append("\n".join(section))
+
+    take("Relevant invariants", inv_lines)
+    take("Relevant policies", pol_lines)
+    take("Relevant intents", int_lines)
+
+    if len(sections) == 1:
+        # Spec terms didn't match any recovery facts — fall back to digest summary
+        digest = build_digest_fallback(sme_root)
+        print(PRIMING_HEADER + "\n" + digest[:budget_chars])
+        return 0
+
+    print("\n".join(sections))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
