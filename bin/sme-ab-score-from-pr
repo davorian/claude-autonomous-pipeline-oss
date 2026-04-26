@@ -1,0 +1,134 @@
+#!/bin/bash
+# sme-ab-score-from-pr — Auto-derive a review_score from GitHub PR state.
+#
+# Reads PR state via `gh pr view` and maps to a 1–5 Likert score:
+#
+#   5  merged, CI green, ≤ 1 review iteration (no force-push between approvals)
+#   4  merged, CI green, 2 review iterations OR small followup-commit count
+#   3  merged after substantive back-and-forth (≥ 3 review iterations)
+#   2  merged with rework (large diff between initial push and merge)
+#   1  closed unmerged
+#
+# These thresholds are heuristic — easy to tune in the script. The point is
+# to produce a defensible default that you can override with sme-ab-score
+# if your judgement differs.
+#
+# Usage:
+#   sme-ab-score-from-pr --run-id UUID --pr NUMBER [--repo OWNER/REPO]
+#                        [--out PATH] [--dry-run]
+
+set -Eeuo pipefail
+_die() { echo "ERROR: $*" >&2; exit 1; }
+
+RUN_ID=""
+PR=""
+REPO=""
+OUT_FILE=""
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --run-id)  RUN_ID="${2:?--run-id needs value}"; shift 2 ;;
+    --pr)      PR="${2:?--pr needs value}"; shift 2 ;;
+    --repo)    REPO="${2:?--repo needs value}"; shift 2 ;;
+    --out)     OUT_FILE="${2:?--out needs value}"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -h|--help) sed -n '/^# Usage:/,/--dry-run/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) _die "unknown arg: $1" ;;
+  esac
+done
+
+[[ -n "$RUN_ID" ]] || _die "--run-id is required"
+[[ -n "$PR" ]]     || _die "--pr is required"
+command -v gh >/dev/null 2>&1 || _die "gh CLI not found on PATH (brew install gh)"
+
+[[ -z "$OUT_FILE" ]] && OUT_FILE="$HOME/.claude-pipeline/ab-runs/scores.jsonl"
+mkdir -p "$(dirname "$OUT_FILE")"
+touch "$OUT_FILE"
+
+# Pull PR state
+GH_ARGS=("pr" "view" "$PR" "--json" "state,mergedAt,reviews,statusCheckRollup,commits,reviewDecision")
+[[ -n "$REPO" ]] && GH_ARGS+=("--repo" "$REPO")
+
+PR_JSON=$(gh "${GH_ARGS[@]}" 2>/dev/null) || _die "gh pr view failed for PR $PR"
+
+# Heuristic scoring
+SCORE=$(python3 <<PY
+import json, sys
+d = json.loads('''$PR_JSON''')
+state = d.get("state", "")
+merged = d.get("mergedAt") is not None
+
+# Closed unmerged → 1
+if state == "CLOSED" and not merged:
+    print(1); sys.exit(0)
+
+# CI green check
+checks = d.get("statusCheckRollup") or []
+ci_green = all(
+    (c.get("conclusion") in (None, "SUCCESS", "NEUTRAL", "SKIPPED")
+     or c.get("state") in (None, "SUCCESS", "EXPECTED"))
+    for c in checks
+) if checks else True
+
+# Review iteration count: number of reviews (excluding bot reviews)
+reviews = [r for r in (d.get("reviews") or [])
+           if r.get("author", {}).get("login") not in ("cursor", "github-actions")]
+review_rounds = len(reviews)
+
+# Commit count post-first-push (proxy for rework volume)
+commits = d.get("commits") or []
+n_commits = len(commits)
+
+if not merged:
+    # Open PR — neutral 3
+    print(3); sys.exit(0)
+
+# Merged path
+if ci_green and review_rounds <= 1:
+    print(5); sys.exit(0)
+if ci_green and (review_rounds == 2 or n_commits <= 5):
+    print(4); sys.exit(0)
+if review_rounds >= 3 or n_commits >= 10:
+    if n_commits >= 15:
+        print(2); sys.exit(0)
+    print(3); sys.exit(0)
+print(3)
+PY
+)
+
+[[ "$SCORE" =~ ^[1-5]$ ]] || _die "scoring heuristic produced invalid score: $SCORE"
+
+NOTE=$(echo "$PR_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+state = d.get("state","")
+merged = "merged" if d.get("mergedAt") else "unmerged"
+n_reviews = len([r for r in (d.get("reviews") or []) if r.get("author",{}).get("login") not in ("cursor","github-actions")])
+n_commits = len(d.get("commits") or [])
+print(f"auto-derived from PR: state={state} {merged}, reviews={n_reviews}, commits={n_commits}")
+')
+
+if [[ "$DRY_RUN" = true ]]; then
+  echo "would write: run_id=$RUN_ID score=$SCORE note=$NOTE" >&2
+  exit 0
+fi
+
+jq -nc \
+  --arg run_id "$RUN_ID" \
+  --arg score "$SCORE" \
+  --arg note "$NOTE" \
+  --arg pr "$PR" \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{
+    run_id: $run_id,
+    score: ($score | tonumber),
+    score_source: "auto-pr",
+    scored_at: $ts,
+    note: $note,
+    pr_number: ($pr | tonumber)
+  }' >> "$OUT_FILE"
+
+echo "[sme-ab-score-from-pr] run_id=$RUN_ID pr=$PR score=$SCORE source=auto-pr" >&2
+echo "[sme-ab-score-from-pr] $NOTE" >&2
+echo "[sme-ab-score-from-pr] appended to $OUT_FILE" >&2

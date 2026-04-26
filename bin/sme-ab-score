@@ -1,0 +1,66 @@
+#!/bin/bash
+# sme-ab-score — Append a manual review_score for a previously-recorded run.
+#
+# Scores are stored in scores.jsonl (separate from runs.jsonl) so the run
+# ledger stays immutable. The reporter joins runs to scores by run_id at
+# read time.
+#
+# Scale (1–5 Likert):
+#   5  Shipped as-is, no follow-up
+#   4  Minor cleanup before merge
+#   3  Substantive review feedback addressed before merge
+#   2  Significant rework — half the diff was redone
+#   1  Scrapped or fully rewritten manually
+#
+# Usage:
+#   sme-ab-score --run-id UUID --score 1-5 [--note TEXT] [--out PATH]
+#
+#   --run-id   uuid of a row in runs.jsonl (or any other identifier you'll
+#              join on; the scorer doesn't validate against runs.jsonl)
+#   --score    integer 1..5
+#   --note     free-form context (optional)
+#   --out      scores.jsonl path (default: ~/.claude-pipeline/ab-runs/scores.jsonl)
+
+set -Eeuo pipefail
+_die() { echo "ERROR: $*" >&2; exit 1; }
+
+RUN_ID=""
+SCORE=""
+NOTE=""
+OUT_FILE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --run-id) RUN_ID="${2:?--run-id needs value}"; shift 2 ;;
+    --score)  SCORE="${2:?--score needs value}"; shift 2 ;;
+    --note)   NOTE="${2:?--note needs value}"; shift 2 ;;
+    --out)    OUT_FILE="${2:?--out needs value}"; shift 2 ;;
+    -h|--help) sed -n '/^# Usage:/,/--out/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) _die "unknown arg: $1" ;;
+  esac
+done
+
+[[ -n "$RUN_ID" ]] || _die "--run-id is required"
+[[ -n "$SCORE" ]]  || _die "--score is required"
+[[ "$SCORE" =~ ^[1-5]$ ]] || _die "--score must be an integer 1..5 (got: $SCORE)"
+
+[[ -z "$OUT_FILE" ]] && OUT_FILE="$HOME/.claude-pipeline/ab-runs/scores.jsonl"
+mkdir -p "$(dirname "$OUT_FILE")"
+touch "$OUT_FILE"
+
+jq -nc \
+  --arg run_id "$RUN_ID" \
+  --arg score "$SCORE" \
+  --arg note "$NOTE" \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{
+    run_id: $run_id,
+    score: ($score | tonumber),
+    score_source: "manual",
+    scored_at: $ts,
+    note: (if $note == "" then null else $note end),
+    pr_number: null
+  }' >> "$OUT_FILE"
+
+echo "[sme-ab-score] run_id=$RUN_ID score=$SCORE source=manual" >&2
+echo "[sme-ab-score] appended to $OUT_FILE" >&2
