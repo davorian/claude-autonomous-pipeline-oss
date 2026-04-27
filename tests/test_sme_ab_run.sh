@@ -74,10 +74,12 @@ grep -q "task_type must be one of" /tmp/err.log && _pass "error message lists va
   || _fail "error message lists valid types" "got: $(cat /tmp/err.log)"
 _teardown
 
-# 2. Rejects bad sme-mode
+# 2. Rejects bad sme-mode (only off|on|both accepted)
 _setup
 "$SME_AB" --spec /dev/null --task-type bugfix --sme-mode maybe 2>/tmp/err.log && \
   _fail "rejects bad sme-mode" || _pass "rejects bad sme-mode"
+grep -q "off.*on.*both" /tmp/err.log && _pass "error lists all three valid modes" \
+  || _fail "error lists all three valid modes" "$(cat /tmp/err.log)"
 _teardown
 
 # 3. SME-mode off run: no preamble, row appended with sme_mode=off
@@ -210,18 +212,45 @@ last=$(tail -n1 "$TEST_TMPDIR/runs.jsonl")
 _assert_eq "source=manual when --task-type given without override"  "manual"  "$(echo "$last" | jq -r .task_type_source)"
 _teardown
 
-# 10. Conflicting flags: --paired with --sme-mode rejected
+# 10. Unknown legacy flag (--paired) is rejected
 _setup
 SPEC="$TEST_TMPDIR/spec.md"
 echo "x" > "$SPEC"
-"$SME_AB" --spec "$SPEC" --task-type bugfix --sme-mode on --paired 2>/tmp/err.log \
-  && _fail "rejects --paired with --sme-mode" \
-  || _pass "rejects --paired with --sme-mode"
-grep -q "mutually exclusive" /tmp/err.log && _pass "mutual-exclusion message" \
-  || _fail "mutual-exclusion message" "$(cat /tmp/err.log)"
+"$SME_AB" --spec "$SPEC" --task-type bugfix --paired 2>/tmp/err.log \
+  && _fail "rejects legacy --paired flag" \
+  || _pass "rejects legacy --paired flag"
+grep -q "unknown arg" /tmp/err.log && _pass "rejects-unknown-arg message" \
+  || _fail "rejects-unknown-arg message" "$(cat /tmp/err.log)"
 _teardown
 
-# 11a. Default (no --sme-mode, no --paired) is paired
+# 11. --sme-mode both: explicit paired — two rows, off + on, shared pair_id
+_setup
+REPO="$TEST_TMPDIR/repo"
+_make_repo "$REPO"
+"$SME_INIT" "$REPO" >/dev/null
+ln -sf "$SCRIPT_DIR/sme-classify-task" "$HOME/bin/sme-classify-task"
+SPEC="$REPO/spec.md"
+echo "fix bug in lib/foo.ex" > "$SPEC"
+( cd "$REPO" && "$SME_AB" --spec "$SPEC" --sme-mode both \
+    --auto-claude "$FAKE_AC" --out "$TEST_TMPDIR/runs.jsonl" \
+    --repo-id "acme__widget" >/dev/null 2>&1 ) || true
+
+total=$(wc -l < "$TEST_TMPDIR/runs.jsonl" | tr -d ' ')
+_assert_eq "--sme-mode both: 2 rows" "2" "$total"
+modes=$(jq -r '.sme_mode' "$TEST_TMPDIR/runs.jsonl" | sort)
+[ "$modes" = "off
+on" ] && _pass "--sme-mode both: rows are off + on" \
+  || _fail "--sme-mode both: rows are off + on" "got: $modes"
+n_pairs=$(jq -r '.pair_id' "$TEST_TMPDIR/runs.jsonl" | sort -u | grep -v '^null$' | wc -l | tr -d ' ')
+_assert_eq "--sme-mode both: shared pair_id" "1" "$n_pairs"
+worktrees=$(jq -r '.worktree_path' "$TEST_TMPDIR/runs.jsonl" | sort -u | wc -l | tr -d ' ')
+_assert_eq "--sme-mode both: distinct worktree paths" "2" "$worktrees"
+git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}' | while read wt; do
+  [ "$wt" = "$REPO" ] || git -C "$REPO" worktree remove --force "$wt" 2>/dev/null || true
+done
+_teardown
+
+# 12. Omitting --sme-mode defaults to 'both' (paired)
 _setup
 REPO="$TEST_TMPDIR/repo"
 _make_repo "$REPO"
@@ -233,43 +262,7 @@ echo "fix bug in lib/foo.ex" > "$SPEC"
     --auto-claude "$FAKE_AC" --out "$TEST_TMPDIR/runs.jsonl" \
     --repo-id "acme__widget" >/dev/null 2>&1 ) || true
 total=$(wc -l < "$TEST_TMPDIR/runs.jsonl" | tr -d ' ')
-_assert_eq "default writes 2 rows (paired by default)" "2" "$total"
-n_pairs=$(jq -r '.pair_id' "$TEST_TMPDIR/runs.jsonl" | sort -u | grep -v '^null$' | wc -l | tr -d ' ')
-_assert_eq "default rows share a pair_id" "1" "$n_pairs"
-git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}' | while read wt; do
-  [ "$wt" = "$REPO" ] || git -C "$REPO" worktree remove --force "$wt" 2>/dev/null || true
-done
-_teardown
-
-# 11. --paired: spawns two worktree runs, both rows share a pair_id
-_setup
-REPO="$TEST_TMPDIR/repo"
-_make_repo "$REPO"
-"$SME_INIT" "$REPO" >/dev/null
-ln -sf "$SCRIPT_DIR/sme-classify-task" "$HOME/bin/sme-classify-task"
-SPEC="$REPO/spec.md"
-echo "fix bug in lib/foo.ex" > "$SPEC"
-# Override worktree base for test isolation
-export HOME_BACKUP="$HOME"
-( cd "$REPO" && "$SME_AB" --spec "$SPEC" --paired \
-    --auto-claude "$FAKE_AC" --out "$TEST_TMPDIR/runs.jsonl" \
-    --repo-id "acme__widget" >/dev/null 2>&1 ) || true
-total=$(wc -l < "$TEST_TMPDIR/runs.jsonl" | tr -d ' ')
-_assert_eq "paired writes 2 rows" "2" "$total"
-
-pair_ids=$(jq -r '.pair_id' "$TEST_TMPDIR/runs.jsonl" | sort -u)
-n_unique_pair_ids=$(echo "$pair_ids" | wc -l | tr -d ' ')
-_assert_eq "both rows share one pair_id" "1" "$n_unique_pair_ids"
-
-modes=$(jq -r '.sme_mode' "$TEST_TMPDIR/runs.jsonl" | sort)
-[ "$modes" = "off
-on" ] && _pass "rows are mode=off and mode=on" \
-  || _fail "rows are mode=off and mode=on" "got: $modes"
-
-worktrees=$(jq -r '.worktree_path' "$TEST_TMPDIR/runs.jsonl" | sort -u | wc -l | tr -d ' ')
-_assert_eq "rows reference distinct worktree paths" "2" "$worktrees"
-
-# Cleanup the worktrees the test created
+_assert_eq "default writes 2 rows (defaults to both)" "2" "$total"
 git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}' | while read wt; do
   [ "$wt" = "$REPO" ] || git -C "$REPO" worktree remove --force "$wt" 2>/dev/null || true
 done

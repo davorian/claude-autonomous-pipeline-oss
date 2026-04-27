@@ -5,17 +5,21 @@
 # AUTO_CLAUDE_PROMPT_PREAMBLE, captures per-run metrics including
 # task_type, and appends one row to the runs.jsonl ledger.
 #
-# Paired-parallel (DEFAULT — A/B by default):
-#   sme-ab-run --spec PATH [--task-type TYPE]
-#   Forks TWO parallel runs in fresh git worktrees from the same baseline:
-#   one with sme-mode=off, one with sme-mode=on. Both rows share a pair_id
-#   so the reporter can identify paired observations. You inspect the two
-#   worktrees afterwards and merge whichever you prefer. --paired stays as
-#   an explicit form for clarity but is equivalent to no mode flag.
+# Mode is selected by --sme-mode {off|on|both}. Default is 'both' — A/B
+# data by default. Single axis, no other mode flag.
 #
-# Single-mode (opt out via --sme-mode):
-#   sme-ab-run --spec PATH --sme-mode {on|off} [--task-type TYPE]
-#   Runs auto_claude once. Cheaper but doesn't generate paired A/B data.
+#   off    Single run with no SME priming (control).
+#   on     Single run with SME priming injected via AUTO_CLAUDE_PROMPT_PREAMBLE.
+#   both   Paired-parallel: two runs in fresh git worktrees from the same
+#          baseline, one off + one on. Both rows share a pair_id so the
+#          reporter can identify paired observations. You inspect both
+#          worktrees afterwards and merge whichever output you prefer.
+#
+# Examples:
+#   sme-ab-run --spec PATH                          # → both (paired, default)
+#   sme-ab-run --spec PATH --sme-mode both          # → both (explicit)
+#   sme-ab-run --spec PATH --sme-mode off           # → single, no priming
+#   sme-ab-run --spec PATH --sme-mode on            # → single, with priming
 #
 # Common flags:
 #   --task-type TYPE    one of: feature bugfix refactor greenfield
@@ -41,7 +45,6 @@ VALID_TASK_TYPES="feature bugfix refactor greenfield new-pattern cross-cutting o
 SPEC=""
 TASK_TYPE=""
 SME_MODE=""
-PAIRED=false
 OVERRIDE_AUTO=false
 REPO_ID=""
 OUT_FILE=""
@@ -53,31 +56,28 @@ while [[ $# -gt 0 ]]; do
     --spec)          SPEC="${2:?--spec needs value}"; shift 2 ;;
     --task-type)     TASK_TYPE="${2:?--task-type needs value}"; shift 2 ;;
     --sme-mode)      SME_MODE="${2:?--sme-mode needs value}"; shift 2 ;;
-    --paired)        PAIRED=true; shift ;;
     --override-auto) OVERRIDE_AUTO=true; shift ;;
     --repo-id)       REPO_ID="${2:?--repo-id needs value}"; shift 2 ;;
     --out)           OUT_FILE="${2:?--out needs value}"; shift 2 ;;
     --max-tokens)    MAX_TOKENS="${2:?--max-tokens needs value}"; shift 2 ;;
     --auto-claude)   AUTO_CLAUDE_BIN="${2:?--auto-claude needs value}"; shift 2 ;;
-    -h|--help) sed -n '/^# Paired-parallel/,/^# Exit/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help) sed -n '/^# Mode is selected/,/^# Exit/p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) _die "unknown arg: $1" ;;
   esac
 done
 
 [[ -n "$SPEC" ]] || _die "--spec is required"
 
-# Mode validation: --paired and --sme-mode are mutually exclusive.
-# Default (neither flag given) is paired — A/B by default.
-if [[ "$PAIRED" = true && -n "$SME_MODE" ]]; then
-  _die "--paired and --sme-mode are mutually exclusive"
-fi
-if [[ -z "$SME_MODE" ]]; then
-  PAIRED=true
-fi
-if [[ "$PAIRED" = false ]]; then
-  [[ "$SME_MODE" = "on" || "$SME_MODE" = "off" ]] \
-    || _die "sme-mode must be 'on' or 'off' (got: $SME_MODE)"
-fi
+# Mode validation. Unset defaults to 'both' (paired). Three values only:
+#   off  → single, no priming
+#   on   → single, with priming
+#   both → paired-parallel (two worktrees, one off + one on)
+[[ -z "$SME_MODE" ]] && SME_MODE="both"
+case "$SME_MODE" in
+  off|on|both) ;;
+  *) _die "sme-mode must be 'off', 'on', or 'both' (got: $SME_MODE)" ;;
+esac
+[[ "$SME_MODE" = "both" ]] && PAIRED=true || PAIRED=false
 
 # Task-type validation (if explicit)
 if [[ -n "$TASK_TYPE" ]]; then
