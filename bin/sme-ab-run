@@ -5,17 +5,17 @@
 # AUTO_CLAUDE_PROMPT_PREAMBLE, captures per-run metrics including
 # task_type, and appends one row to the runs.jsonl ledger.
 #
-# Single-mode (default):
-#   sme-ab-run --spec PATH --sme-mode {on|off} [--task-type TYPE]
-#   Runs auto_claude once. If --task-type is omitted, sme-classify-task
-#   auto-classifies and records the rationale.
-#
-# Paired-parallel (opt-in, deliberate):
-#   sme-ab-run --spec PATH --paired [--task-type TYPE]
+# Paired-parallel (DEFAULT — A/B by default):
+#   sme-ab-run --spec PATH [--task-type TYPE]
 #   Forks TWO parallel runs in fresh git worktrees from the same baseline:
 #   one with sme-mode=off, one with sme-mode=on. Both rows share a pair_id
 #   so the reporter can identify paired observations. You inspect the two
-#   worktrees afterwards and merge whichever you prefer.
+#   worktrees afterwards and merge whichever you prefer. --paired stays as
+#   an explicit form for clarity but is equivalent to no mode flag.
+#
+# Single-mode (opt out via --sme-mode):
+#   sme-ab-run --spec PATH --sme-mode {on|off} [--task-type TYPE]
+#   Runs auto_claude once. Cheaper but doesn't generate paired A/B data.
 #
 # Common flags:
 #   --task-type TYPE    one of: feature bugfix refactor greenfield
@@ -59,18 +59,22 @@ while [[ $# -gt 0 ]]; do
     --out)           OUT_FILE="${2:?--out needs value}"; shift 2 ;;
     --max-tokens)    MAX_TOKENS="${2:?--max-tokens needs value}"; shift 2 ;;
     --auto-claude)   AUTO_CLAUDE_BIN="${2:?--auto-claude needs value}"; shift 2 ;;
-    -h|--help) sed -n '/^# Single-mode/,/^# Exit/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help) sed -n '/^# Paired-parallel/,/^# Exit/p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) _die "unknown arg: $1" ;;
   esac
 done
 
 [[ -n "$SPEC" ]] || _die "--spec is required"
 
-# Mode validation: --paired XOR --sme-mode
-if [[ "$PAIRED" = true ]]; then
-  [[ -z "$SME_MODE" ]] || _die "--paired and --sme-mode are mutually exclusive"
-else
-  [[ -n "$SME_MODE" ]] || _die "either --sme-mode {on|off} or --paired is required"
+# Mode validation: --paired and --sme-mode are mutually exclusive.
+# Default (neither flag given) is paired — A/B by default.
+if [[ "$PAIRED" = true && -n "$SME_MODE" ]]; then
+  _die "--paired and --sme-mode are mutually exclusive"
+fi
+if [[ -z "$SME_MODE" ]]; then
+  PAIRED=true
+fi
+if [[ "$PAIRED" = false ]]; then
   [[ "$SME_MODE" = "on" || "$SME_MODE" = "off" ]] \
     || _die "sme-mode must be 'on' or 'off' (got: $SME_MODE)"
 fi

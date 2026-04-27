@@ -221,6 +221,26 @@ grep -q "mutually exclusive" /tmp/err.log && _pass "mutual-exclusion message" \
   || _fail "mutual-exclusion message" "$(cat /tmp/err.log)"
 _teardown
 
+# 11a. Default (no --sme-mode, no --paired) is paired
+_setup
+REPO="$TEST_TMPDIR/repo"
+_make_repo "$REPO"
+"$SME_INIT" "$REPO" >/dev/null
+ln -sf "$SCRIPT_DIR/sme-classify-task" "$HOME/bin/sme-classify-task"
+SPEC="$REPO/spec.md"
+echo "fix bug in lib/foo.ex" > "$SPEC"
+( cd "$REPO" && "$SME_AB" --spec "$SPEC" \
+    --auto-claude "$FAKE_AC" --out "$TEST_TMPDIR/runs.jsonl" \
+    --repo-id "acme__widget" >/dev/null 2>&1 ) || true
+total=$(wc -l < "$TEST_TMPDIR/runs.jsonl" | tr -d ' ')
+_assert_eq "default writes 2 rows (paired by default)" "2" "$total"
+n_pairs=$(jq -r '.pair_id' "$TEST_TMPDIR/runs.jsonl" | sort -u | grep -v '^null$' | wc -l | tr -d ' ')
+_assert_eq "default rows share a pair_id" "1" "$n_pairs"
+git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}' | while read wt; do
+  [ "$wt" = "$REPO" ] || git -C "$REPO" worktree remove --force "$wt" 2>/dev/null || true
+done
+_teardown
+
 # 11. --paired: spawns two worktree runs, both rows share a pair_id
 _setup
 REPO="$TEST_TMPDIR/repo"
