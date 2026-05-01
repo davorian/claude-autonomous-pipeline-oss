@@ -7,10 +7,16 @@ A reusable autonomous feature pipeline that executes specs end-to-end — from p
 ## Usage
 
 ```bash
-auto_claude [--opinionated] <path-to-spec.md>
+auto_claude [--opinionated] [--rigorous] [--skip-vacuousness-gate]
+            [--auto-rewrite-vacuous] [--vacuousness-format json|human]
+            [--vacuousness-only [--files <list> | --diff <ref>]]
+            [--skip <phase>]... [--only <phase>]
+            <path-to-spec.md>
 ```
 
 The spec is a markdown file following the format defined in `CLAUDE.md`. It describes what to build, not how to build it — the pipeline works that out.
+
+A spec can also opt into the full vacuousness gate via frontmatter — `rigorous: true` between leading `---` markers is treated as `--rigorous`.
 
 ---
 
@@ -19,19 +25,25 @@ The spec is a markdown file following the format defined in `CLAUDE.md`. It desc
 The pipeline splits into two blocks at a configurable **seam** (`SEAM_AFTER`, default: `ci_checks`).
 
 ```
-Authoring block              Quality block
-───────────────────────      ──────────────────────────────────────────
-plan                         impact
-  ↓                            ↓
-decisions                    skill_chain (incl. pattern conformance)
-  ↓                            ↓
-test_intent  [TDD_ENABLED]   loc_enforcement
-  ↓                            ↓
-pattern_baseline [PATTERN_CONFORMANCE]  fresh_review
-  ↓                            ↓
-implement                    doc_update
-  ↓                            ↓
-test_fix                     final
+Authoring block                            Quality block
+─────────────────────────────────────      ──────────────────────────────────────────
+plan                                       impact
+  ↓                                          ↓
+decisions                                  skill_chain (incl. pattern conformance)
+  ↓                                          ↓
+test_intent  [TDD_ENABLED]                 loc_enforcement
+  ↓                                          ↓
+vacuousness_pass_1  (Gate 1, always on)    fresh_review
+  ↓                                          ↓
+pattern_baseline [PATTERN_CONFORMANCE]     doc_update
+  ↓                                          ↓
+implement                                  final
+  ↓
+test_fix
+  ↓
+vacuousness_pass_2_semantic   [RIGOROUS]
+  ↓
+vacuousness_pass_2_coverage   [RIGOROUS]
   ↓
 ci_checks  ── seam ──▶
 ```
@@ -64,7 +76,10 @@ Reads the spec and produces a numbered implementation checklist. Uses `PLAN_CONT
 Writes an explainability manifest to `.auto_claude_explain/decisions.json` capturing key decisions made during planning — what was chosen, what alternatives were considered, and why. Controlled by `EXPLAIN_PHASES` (default: true). Skipped when explainability is disabled.
 
 ### `test_intent`
-TDD test-first phase. Controlled by `TDD_ENABLED` (default: true). Reads the spec and plan, then asks Claude to write test stubs and skeleton assertions that express the spec's requirements — before any implementation exists. Verifies that a test run produces red (failing) results, confirming the tests are meaningful. The intent map is stored in state at `.semantic.test_intent_map` for use by `phase_implement`.
+TDD test-first phase. Controlled by `TDD_ENABLED` (default: true). Reads the spec and plan, then asks Claude to write test stubs and skeleton assertions that express the spec's requirements — before any implementation exists. Verifies that a test run produces red (failing) results, confirming the tests are meaningful. The intent map is stored in state at `.semantic.test_intent_map` for use by `phase_implement`. Also persists the new test files' paths to `.deterministic.test_intent.files_added` so the vacuousness gate can scope itself to just the new tests.
+
+### `vacuousness_pass_1` (Gate 1 — TDD-ordering)
+Cheap TDD-ordering check. Always on (gated by `SKIP_VACUOUSNESS_GATE`). Re-runs the suite with the new test files in place but BEFORE `implement` has produced its diff. If every suite passes, the new tests assert on behaviour that is already true → vacuous. Hard-fails the pipeline; with `AUTO_REWRITE_VACUOUS=1` (or `--auto-rewrite-vacuous`) it asks Claude to rewrite the offending tests to assert on observable side-effects of the not-yet-written implementation, looping up to `VACUOUSNESS_RETRY_LIMIT` times. Findings persist to `.auto_claude_explain/vacuousness_pass_1.json` and `.semantic.vacuousness.pass_1`. See `docs/vacuousness_taxonomy.md`.
 
 ### `pattern_baseline`
 Catalogues existing coding patterns in the areas about to be changed. Controlled by `PATTERN_CONFORMANCE` (default: true). Claude reads files adjacent to the planned changes and records naming conventions, error handling patterns, import styles, and structural patterns. The baseline is stored in state at `.semantic.pattern_baseline` and used later by `skill_chain` for conformance checking.
@@ -74,6 +89,12 @@ Executes the plan. Writes code and tests. No commits. When `TDD_ENABLED` is true
 
 ### `test_fix`
 Runs all `test_suite_*()` functions. On failure, sends output to Claude for fixes. Loops up to `MAX_TEST_ITERATIONS` (default: 5).
+
+### `vacuousness_pass_2_semantic` (Gate 2 — semantic mutation)
+Opt-in via `--rigorous` or `RIGOROUS=1`. Runs after `test_fix` (impl + tests are green). Loads the mutation taxonomy from `docs/vacuousness_taxonomy.md` (overridable via `VACUOUSNESS_TAXONOMY_PATH`) and asks Claude to enumerate every applicable semantic mutant across the changed impl files (no_op_body, drop_side_effect, drop_filter, swap_query_subject, swap_column, invert_boolean, skip_iteration, constant_return). For each mutant, applies it via `_vacuous_apply_mutant` (atomic save → swap → run suite → restore), classifies as **killed** (tests fail) or **survived** (tests still pass), and surfaces survivors as vacuous coverage. `SYNTAX_CHECK_COMMAND` filters out unparseable mutants. `EXPECTED_SURVIVORS` (newline-separated `file:line:category`) suppresses known-equivalent mutants. Findings persist to `.auto_claude_explain/vacuousness_pass_2_semantic.json` and `.semantic.vacuousness.pass_2_semantic`.
+
+### `vacuousness_pass_2_coverage` (Gate 3 — coverage-driven mutation)
+Opt-in via `--rigorous`. Reads `coverage_map.json` (auto-runs `COVERAGE_COMMAND` or auto-detects `mix test --cover` / `npm test -- --coverage` / `pytest --cov` if missing), surfaces uncovered lines, and runs targeted line-level mutations at covered-but-suspect lines. Surviving targeted mutants → weakly-covered lines (the high-coverage-low-confidence shape). For each survivor, asks Claude for a one-paragraph assertion shape that would kill the mutant. Findings persist to `.auto_claude_explain/vacuousness_pass_2_coverage.json` and `.semantic.vacuousness.pass_2_coverage`. `fresh_review` reads all three vacuousness artefacts into its context pack so the cold reviewer can challenge anything auto-rewrite did not resolve.
 
 ### `ci_checks`
 Runs all `ci_check_*()` functions. Two-track fix strategy:
@@ -125,6 +146,23 @@ OPINIONATED=false           # See Opinionated Mode below
 TDD_ENABLED=true            # Enable test_intent phase and TDD-aware implement
 PATTERN_CONFORMANCE=true    # Enable pattern_baseline phase and conformance in skill_chain
 ```
+
+### Optional — vacuousness gate (CAP-VG-001)
+
+```bash
+RIGOROUS=0                       # opt-in to Gates 2 + 3 (mutation testing)
+SKIP_VACUOUSNESS_GATE=0          # bypass all three vacuousness phases
+AUTO_REWRITE_VACUOUS=0           # rewrite-on-failure inside the gate
+VACUOUSNESS_FORMAT="human"       # "human" or "json" (JSON for CI / skill)
+VACUOUSNESS_RETRY_LIMIT=2        # auto-rewrite retry cap (Pass 1)
+VACUOUSNESS_TAXONOMY_PATH=""     # override docs/vacuousness_taxonomy.md path
+EXPECTED_SURVIVORS=""            # newline-separated file:line:category
+                                 # list of known-equivalent mutants
+COVERAGE_COMMAND=""              # fallback coverage command (auto-detected if empty)
+SYNTAX_CHECK_COMMAND=""          # parse check for mutants (e.g. "mix compile --no-deps-check")
+```
+
+CLI flags `--rigorous`, `--skip-vacuousness-gate`, `--auto-rewrite-vacuous`, and `--vacuousness-format` override these. A spec frontmatter `rigorous: true` between leading `---` markers is equivalent to `--rigorous`. `--vacuousness-only [--files <list> | --diff <ref>]` runs the gate as a standalone tool against the supplied files (used by the `check-vacuousness` skill).
 
 ### Optional — prompt fragments
 
@@ -218,7 +256,7 @@ Resume after a crash — the pipeline detects an interrupted run on next invocat
 | `.auto_claude_baseline` | Snapshot of untracked files at pipeline start (deleted on completion) |
 | `.auto_claude.lock/` | Concurrency guard — prevents two instances running on the same project |
 | `.auto_claude_ownership.json` | Boundary manifest — written by `worktree_auto_claude`, read by `_load_ownership_manifest` to constrain each instance to its owned files |
-| `.auto_claude_explain/` | Explainability artifacts — `decisions.json`, `assumptions.json`, `coverage_map.json`, `impact_assessment.md` |
+| `.auto_claude_explain/` | Explainability artifacts — `decisions.json`, `assumptions.json`, `coverage_map.json`, `impact_assessment.md`, `vacuousness_pass_1.json`, `vacuousness_pass_2_semantic.json`, `vacuousness_pass_2_coverage.json` |
 
 ---
 
@@ -242,6 +280,12 @@ The test suite mirrors the structure of the pipeline — one test file per funct
 | `test_auto_claude_phase_final.sh` | Git staging loop — `git check-ignore` exit code handling, artifact filtering |
 | `test_auto_claude_escalation.sh` | Escalation strategy and boundary violation handling |
 | `test_auto_claude_ownership.sh` | Ownership manifest loading and context building |
+| `test_vacuousness_pass_1.sh` | Gate 1: TDD-ordering check, auto-rewrite loop, retry-limit hard-fail |
+| `test_vacuousness_pass_2_semantic.sh` | Gate 2: mutant apply/restore, kill/survive classification, syntax-check + EXPECTED_SURVIVORS filters |
+| `test_vacuousness_pass_2_coverage.sh` | Gate 3: coverage-map parse, weakly-covered-line surfacing, fallback coverage command |
+| `test_vacuousness_phase_integration.sh` | Dispatcher policy (skip / rigorous / vacuousness-only), spec frontmatter parse, fresh_review context pack injection |
+| `test_vacuousness_skill.sh` | `skills/check-vacuousness/SKILL.md` invocation contract, `--vacuousness-only` JSON output shape |
+| `test_vacuousness_taxonomy.sh` | `docs/vacuousness_taxonomy.md` cache, fallback when missing, schema doc completeness |
 
 Run all tests:
 ```bash

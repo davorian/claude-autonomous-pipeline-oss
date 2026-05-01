@@ -4,7 +4,7 @@
 
 Two bash scripts that form a reusable autonomous pipeline engine:
 
-- `bin/auto_claude` (~4000 lines) — single-project pipeline: plan → decisions → test_intent → pattern_baseline → implement → test_fix → ci_checks → impact → skill_chain → loc_enforcement → fresh_review → doc_update → final
+- `bin/auto_claude` (~4500 lines) — single-project pipeline: plan → decisions → test_intent → vacuousness_pass_1 → pattern_baseline → implement → test_fix → vacuousness_pass_2_semantic → vacuousness_pass_2_coverage → ci_checks → impact → skill_chain → loc_enforcement → fresh_review → doc_update → final
 - `bin/worktree_auto_claude` (~1300 lines) — parallel orchestrator: forks git worktrees, runs independent auto_claude instances, cherry-picks results back
 
 Project-specific configuration lives in `.auto_claude.conf` files (see `conf/` for examples).
@@ -20,6 +20,8 @@ conf/
 ├── aurora.auto_claude.conf   # Example: Aurora project config
 ├── platform.auto_claude.conf # Example: NICE platform config
 └── user_home.auto_claude.conf # Example: user home directory config
+skills/
+└── check-vacuousness/SKILL.md # Ad-hoc invocation of the vacuousness gate (CAP-VG-001)
 tests/
 ├── test_auto_claude_all.sh       # Runner: executes all test suites
 ├── test_auto_claude_state.sh     # State file, context packs, test results
@@ -27,10 +29,17 @@ tests/
 ├── test_auto_claude_ci_checks.sh # CI check discovery, auto-fix, Claude-fix
 ├── test_auto_claude_phase_final.sh # Final phase, auto-commit logic
 ├── test_auto_claude_escalation.sh  # Escalation strategy and boundary violations
-└── test_auto_claude_ownership.sh   # Ownership manifest loading and context building
+├── test_auto_claude_ownership.sh   # Ownership manifest loading and context building
+├── test_vacuousness_pass_1.sh      # Gate 1: TDD-ordering check, auto-rewrite loop
+├── test_vacuousness_pass_2_semantic.sh  # Gate 2: semantic mutation apply/restore, kill/survive
+├── test_vacuousness_pass_2_coverage.sh  # Gate 3: coverage-driven mutation, weakly-covered lines
+├── test_vacuousness_phase_integration.sh # Dispatcher policy, frontmatter parse, fresh_review pack
+├── test_vacuousness_skill.sh           # Skill invocation contract, --vacuousness-only JSON output
+└── test_vacuousness_taxonomy.sh        # Taxonomy load/cache, fallback when missing
 docs/
 ├── auto_claude.md                    # Pipeline architecture documentation
-└── auto-claude-explainability-sketch.md # Explainability design notes
+├── auto-claude-explainability-sketch.md # Explainability design notes
+└── vacuousness_taxonomy.md           # Mutation taxonomy + JSON schema (loaded as prompt fragment)
 specs/                                # Feature specs (auto_claude format)
 ```
 
