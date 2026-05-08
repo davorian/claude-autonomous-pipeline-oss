@@ -85,6 +85,13 @@ FRESH_REVIEW_PREAMBLE=""
 FRESH_REVIEW_EXTRAS=""
 DOC_UPDATE_CONTEXT=""
 
+# Empirical finding gate (CAP-EFG-001) — see docs/empirical_finding_gate.md.
+# Forces phase_fresh_review to test H/M-severity falsifiable claims before
+# posting them, or downgrade them to questions if testing isn't possible.
+# Loaded into the fresh_review prompt automatically.
+EMPIRICAL_FINDING_GATE_PATH=""        # override docs/empirical_finding_gate.md path
+SKIP_EMPIRICAL_FINDING_GATE=0         # set to 1 to bypass the gate (not recommended)
+
 # File glob patterns — overridable in .auto_claude.conf.
 # TEST_FILE_GLOBS: patterns for test files (used by test audit to detect test changes).
 # SOURCE_FILE_GLOBS: patterns for source files (used by LOC enforcement to find long files).
@@ -3573,6 +3580,42 @@ ${org_rules}"
   echo "$rules"
 }
 
+# Loads the empirical-finding gate (CAP-EFG-001) as a prompt fragment.
+# `phase_fresh_review` injects this so the cold reviewer applies the
+# test-before-claim discipline to every H/M-severity finding it generates.
+# Returns empty if gate is skipped or the file is missing (logged as WARN).
+_load_empirical_finding_gate() {
+  if [ "${SKIP_EMPIRICAL_FINDING_GATE:-0}" = "1" ]; then
+    log INFO "Empirical finding gate skipped (SKIP_EMPIRICAL_FINDING_GATE=1)"
+    return 0
+  fi
+
+  local path="${EMPIRICAL_FINDING_GATE_PATH:-}"
+  if [ -z "$path" ]; then
+    path="${SCRIPT_DIR}/../docs/empirical_finding_gate.md"
+  fi
+
+  if [ ! -f "$path" ]; then
+    log WARN "Empirical finding gate doc missing at ${path} — using minimal fallback"
+    cat <<'EOF'
+
+## Test-before-claim gate (fallback — full doc missing)
+
+For every High-severity finding (and every Medium that makes a falsifiable claim about runtime behaviour):
+
+1. Classify as testable claim vs opinion. Opinions get posted as opinions.
+2. If testable: try to verify (read source / write a 10-30 LOC script / add a regression test).
+3. If verified: post the finding with the test result inline.
+4. If you cannot test it in this session: downgrade the claim to a question, do not post it as a definitive finding.
+
+A confidently-worded testable finding that turns out to be wrong is worse than no finding — it costs the author's time and your credibility on the rest of the review.
+EOF
+    return 0
+  fi
+
+  cat "$path"
+}
+
 phase_fresh_review() {
   local changed_files
   changed_files="$(get_changed_files)"
@@ -3587,6 +3630,9 @@ phase_fresh_review() {
 
   local repo_review_rules
   repo_review_rules=$(_load_repo_review_rules "$changed_files")
+
+  local empirical_finding_gate
+  empirical_finding_gate=$(_load_empirical_finding_gate)
 
   # Fresh context — the reviewer has never seen this code and evaluates it cold.
   # Context pack deliberately excludes plan_intent to avoid anchoring bias.
@@ -3626,7 +3672,9 @@ ${FRESH_REVIEW_EXTRAS:+${FRESH_REVIEW_EXTRAS}
    - Injection risks in queries?
    - Unvalidated user input?
 
-Output a review in this format:
+${empirical_finding_gate:+${empirical_finding_gate}
+
+}Output a review in this format:
 
 ## Fresh-Context Review
 
