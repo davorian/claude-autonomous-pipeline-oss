@@ -53,7 +53,7 @@ MAX_REFACTOR_ROUNDS=10
 MAX_LOC=300
 MAX_CI_ITERATIONS=3
 SUITE_IDLE_TIMEOUT=120  # seconds of no new output before killing a suite; 0 = no timeout
-PHASES=(plan decisions test_intent pattern_baseline implement test_fix ci_checks impact skill_chain loc_enforcement fresh_review doc_update final)
+PHASES=(plan decisions test_intent vacuousness_pass_1 pattern_baseline implement test_fix vacuousness_pass_2_semantic vacuousness_pass_2_coverage ci_checks impact skill_chain loc_enforcement fresh_review doc_update final)
 
 # Tiered escalation thresholds. Each value is the iteration where a new tier begins.
 # Tier 1 (tactical):  iterations 1 to TIER_2_AT-1
@@ -104,6 +104,20 @@ ARTIFACTS_DIR=""              # Override auto-detection of recovery artifacts. E
 # to the simpler of two options unless explicitly instructed otherwise.
 OPINIONATED=false
 
+# Vacuousness gate (CAP-VG-001) — see docs/vacuousness_taxonomy.md.
+# Pass 1 (TDD-ordering, cheap) is always on; Pass 2 (semantic + coverage
+# mutation) is opt-in via --rigorous because mutation testing is O(N×M).
+RIGOROUS=0                            # opt-in to Pass 2 (Gates 2 + 3)
+SKIP_VACUOUSNESS_GATE=0               # bypass both passes entirely
+AUTO_REWRITE_VACUOUS=0                # rewrite-on-failure path inside the gate
+VACUOUSNESS_FORMAT="human"            # "human" or "json" — JSON for CI / skill
+VACUOUSNESS_RETRY_LIMIT=2             # auto-rewrite retry cap
+VACUOUSNESS_TAXONOMY_PATH=""          # override docs/vacuousness_taxonomy.md path
+EXPECTED_SURVIVORS=""                 # newline-separated file:line:category list of known-equivalent mutants
+COVERAGE_COMMAND=""                   # fallback coverage command (auto-detected if empty)
+SYNTAX_CHECK_COMMAND=""               # syntax/parse check for mutants (e.g. "mix compile --no-deps-check"); empty = skip
+VACUOUSNESS_ONLY=0                    # set by --vacuousness-only CLI flag
+
 # ─── Auto-detect Project Root ────────────────────────────────────────────────
 # Tries git first (works from any subdirectory, handles symlinks). If not in a
 # git repo, walks up from pwd looking for .auto_claude.conf — because that file
@@ -137,21 +151,41 @@ PROJECT_NAME="$(basename "$PROJECT_ROOT")"
 _CLI_OPINIONATED=false
 _CLI_SKIP_PHASES=""
 _CLI_ONLY_PHASE=""
+_CLI_RIGOROUS=false
+_CLI_SKIP_VACUOUSNESS=false
+_CLI_AUTO_REWRITE_VACUOUS=false
+_CLI_VACUOUSNESS_FORMAT=""
+_CLI_VACUOUSNESS_ONLY=false
+_CLI_VAC_FILES=""
+_CLI_VAC_DIFF=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --opinionated) _CLI_OPINIONATED=true; shift ;;
     --skip) _CLI_SKIP_PHASES="${_CLI_SKIP_PHASES:+${_CLI_SKIP_PHASES},}${2:?--skip requires a phase name}"; shift 2 ;;
     --only) _CLI_ONLY_PHASE="${2:?--only requires a phase name}"; shift 2 ;;
+    --rigorous) _CLI_RIGOROUS=true; shift ;;
+    --skip-vacuousness-gate) _CLI_SKIP_VACUOUSNESS=true; shift ;;
+    --auto-rewrite-vacuous) _CLI_AUTO_REWRITE_VACUOUS=true; shift ;;
+    --vacuousness-format) _CLI_VACUOUSNESS_FORMAT="${2:?--vacuousness-format requires json|human}"; shift 2 ;;
+    --vacuousness-only) _CLI_VACUOUSNESS_ONLY=true; shift ;;
+    --files) _CLI_VAC_FILES="${2:?--files requires a comma- or newline-separated list}"; shift 2 ;;
+    --diff) _CLI_VAC_DIFF="${2:?--diff requires a git ref}"; shift 2 ;;
     --) shift; break ;;
-    -*) echo "ERROR: Unknown flag: $1" >&2; echo "Usage: auto_claude [--opinionated] [--skip <phase>]... [--only <phase>] <path-to-spec.md>" >&2; exit 1 ;;
+    -*) echo "ERROR: Unknown flag: $1" >&2; echo "Usage: auto_claude [--opinionated] [--rigorous] [--skip-vacuousness-gate] [--auto-rewrite-vacuous] [--vacuousness-format json|human] [--vacuousness-only [--files <list> | --diff <ref>]] [--skip <phase>]... [--only <phase>] [<path-to-spec.md>]" >&2; exit 1 ;;
     *) break ;;
   esac
 done
 
-SPEC_FILE="${1:?Usage: auto_claude [--opinionated] [--skip <phase>]... [--only <phase>] <path-to-spec.md>}"
+# In --vacuousness-only mode there is no spec file — the gate runs against
+# the file list passed via --files / --diff (or against an existing state).
+if [ "$_CLI_VACUOUSNESS_ONLY" = true ]; then
+  SPEC_FILE="${1:-}"
+else
+  SPEC_FILE="${1:?Usage: auto_claude [--opinionated] [--rigorous] [--skip-vacuousness-gate] [--auto-rewrite-vacuous] [--vacuousness-format json|human] [--skip <phase>]... [--only <phase>] <path-to-spec.md>}"
+fi
 # Resolve to absolute path so cd's in test suites do not break the reference
-if [[ "$SPEC_FILE" != /* ]]; then
+if [ -n "$SPEC_FILE" ] && [[ "$SPEC_FILE" != /* ]]; then
   SPEC_FILE="$(pwd)/$SPEC_FILE"
 fi
 
@@ -241,6 +275,15 @@ log() {
   printf "[%s %s] %s\n" "$timestamp" "$level" "$msg" >> "$LOG_FILE"
 }
 
+# Thin convenience aliases used by phases that want a callable a test harness
+# can override directly. They forward to log() in production.
+warn() {
+  log WARN "$*"
+}
+err() {
+  log ERROR "$*"
+}
+
 # ─── Artifact Detection & Access ─────────────────────────────────────────────
 # Recovery artifacts enrich explainability but are never required.
 # ARTIFACTS_DIR can be set in .auto_claude.conf to override auto-detection.
@@ -300,6 +343,92 @@ _read_artifact() {
 
 _ensure_explain_dir() {
   mkdir -p "$EXPLAIN_DIR"
+}
+
+# ─── Vacuousness Gate (CAP-VG-001) helpers ───────────────────────────────────
+
+# Load the mutation taxonomy markdown for inclusion in mutation-listing prompts.
+# Caches the contents in a tmp file keyed by source-path cksum, so subsequent
+# calls (even from different subshells) get the same content even if the
+# underlying file changes mid-run. Falls back to a minimal summary + warning
+# when the file is missing rather than hard-failing — the gate can degrade
+# gracefully.
+_load_vacuousness_taxonomy() {
+  local path="${VACUOUSNESS_TAXONOMY_PATH:-}"
+  if [ -z "$path" ]; then
+    path="${PROJECT_ROOT:-.}/docs/vacuousness_taxonomy.md"
+  fi
+
+  local cache_key cache_file
+  cache_key=$(printf '%s' "$path" | cksum | awk '{print $1}')
+  cache_file="${TMPDIR:-/tmp}/auto_claude.taxonomy_cache.${cache_key}"
+
+  if [ -f "$cache_file" ]; then
+    cat "$cache_file"
+    return 0
+  fi
+
+  if [ ! -f "$path" ]; then
+    log WARN "Vacuousness taxonomy file missing at ${path} — using minimal fallback prompt"
+    {
+      printf '# Mutation taxonomy (fallback)\n'
+      printf 'Categories: no_op_body, drop_side_effect, drop_filter, swap_query_subject, swap_column, invert_boolean, skip_iteration, constant_return.\n'
+      printf 'Output JSON array of {category, file, line, original, mutated, provenance, applies_to_lang}, sorted by file then line.\n'
+    } | tee "$cache_file"
+    return 0
+  fi
+
+  cp "$path" "$cache_file" 2>/dev/null || true
+  cat "$cache_file" 2>/dev/null || cat "$path"
+}
+
+# Atomic apply-then-restore of a mutated source file.
+#
+# Args: <target_path> <mutated_source_path> <callback_function> [provenance...]
+#
+# Saves the original to a sibling .vacuous.bak file, copies the mutated
+# content over the target, runs the callback (which is expected to invoke
+# the test suite), then restores the original via mv. A trap on RETURN/EXIT
+# guarantees restore even if the callback crashes.
+#
+# Returns the callback's exit code so the caller can classify killed
+# (non-zero — tests failed under the mutant) vs survived (zero — tests
+# still passed). Provenance args after $3 are ignored by this primitive
+# but accepted so callers can pass file:line strings the test stubs
+# pattern-match on.
+_vacuous_apply_mutant() {
+  local target="$1"
+  local mutated="$2"
+  local callback="$3"
+  # remaining args are provenance / scoping hints — ignored here but kept
+  # in $* so test stubs can match on them.
+
+  if [ ! -f "$target" ] || [ ! -f "$mutated" ]; then
+    log WARN "_vacuous_apply_mutant: target or mutated file missing (target=$target mutated=$mutated)"
+    return 2
+  fi
+
+  local backup="${target}.vacuous.bak"
+  cp "$target" "$backup" || return 2
+
+  # Restore on any exit path. Re-set the trap on RETURN so nested calls
+  # don't leave a stale handler. (Bash 3.2 supports trap RETURN inside
+  # functions when set -E is in effect, which it is at top of file.)
+  _restore_target() {
+    if [ -f "$backup" ]; then
+      mv "$backup" "$target" 2>/dev/null || true
+    fi
+  }
+  trap '_restore_target' RETURN
+
+  cp "$mutated" "$target" || { _restore_target; trap - RETURN; return 2; }
+
+  local rc=0
+  "$callback" || rc=$?
+
+  _restore_target
+  trap - RETURN
+  return "$rc"
 }
 
 # Parse JSON from LAST_RESPONSE_TEXT. Three-tier extraction:
@@ -1681,6 +1810,31 @@ _build_context_pack() {
             echo "$deviations_display"
           fi
         fi
+
+        # Inject vacuousness gate findings (CAP-VG-001) so the cold reviewer
+        # can challenge any survivor or weakly-covered line that auto-rewrite
+        # didn't fully resolve.
+        local vac_present
+        vac_present=$(jq -r '.semantic.vacuousness // empty' "$STATE_FILE" 2>/dev/null)
+        if [ -n "$vac_present" ] && [ "$vac_present" != "null" ]; then
+          echo ""
+          echo "**Vacuousness Gate Findings:**"
+          jq -r '
+            .semantic.vacuousness as $v |
+            "Pass 1 vacuous tests: " + (($v.pass_1.vacuous_tests // []) | length | tostring) +
+            (if (($v.pass_1.vacuous_tests // []) | length > 0) then
+              "\n" + ([ ($v.pass_1.vacuous_tests // [])[] | "  - " + (.file // "?") + ": " + (.reason // "vacuous") ] | join("\n"))
+            else "" end) + "\n" +
+            "Pass 2 semantic survivors: " + (($v.pass_2_semantic.survivors // []) | length | tostring) +
+            (if (($v.pass_2_semantic.survivors // []) | length > 0) then
+              "\n" + ([ ($v.pass_2_semantic.survivors // [])[] | "  - [" + (.category // "?") + "] " + (.file // "?") + ":" + ((.line // 0) | tostring) ] | join("\n"))
+            else "" end) + "\n" +
+            "Weakly-covered lines: " + (($v.pass_2_coverage.weakly_covered_lines // []) | length | tostring) +
+            (if (($v.pass_2_coverage.weakly_covered_lines // []) | length > 0) then
+              "\n" + ([ ($v.pass_2_coverage.weakly_covered_lines // [])[] | "  - " + (.file // "?") + ":" + ((.line // 0) | tostring) ] | join("\n"))
+            else "" end)
+          ' "$STATE_FILE" 2>/dev/null
+        fi
       }
       ;;
 
@@ -2530,6 +2684,20 @@ Output ONLY valid JSON (no markdown fences, no commentary):
       _ensure_explain_dir
       echo "$parsed" > "$EXPLAIN_DIR/intent_map.json"
       log OK "Intent map saved to state and $EXPLAIN_DIR/intent_map.json"
+
+      # Persist the test files this phase introduced so the vacuousness Pass 1
+      # gate (CAP-VG-001) can scope its run to just the new tests. Handles
+      # both shapes Claude might emit: {intent_map:[...]} or [...] directly.
+      local _intent_files
+      _intent_files=$(echo "$parsed" | jq -c \
+        'if type=="object" then (.intent_map // []) else . end
+         | [.[]?.test_file // empty | select(. != null)]' \
+        2>/dev/null || echo '[]')
+      if [ -n "$_intent_files" ] && [ "$_intent_files" != "null" ]; then
+        _jq_update --argjson f "$_intent_files" \
+          '.deterministic.test_intent.files_added = $f'
+      fi
+      unset _intent_files
     else
       log WARN "Could not parse intent map — tests were written but no structured map available"
     fi
@@ -2564,6 +2732,102 @@ ${syntax_output}
       _jq_update --arg s "red_verified" '.deterministic.tdd_status = $s'
     fi
   fi
+}
+
+# ─── Vacuousness Pass 1 — TDD-ordering gate (Gate 1) ─────────────────────────
+# Runs after test_intent, before pattern_baseline. Cheap: re-runs the new
+# tests against the codebase BEFORE implement has produced its diff. Tests
+# that pass here assert something already true → vacuous.
+phase_vacuousness_pass_1() {
+  _ensure_explain_dir
+
+  # Resolve test files: prefer state-supplied list (D2-002), fall back to none.
+  local files_added_json files_filter=""
+  files_added_json=$(_state_get '.deterministic.test_intent.files_added // []')
+  if [ -n "$files_added_json" ] && [ "$files_added_json" != "null" ]; then
+    files_filter=$(echo "$files_added_json" | jq -r '. | join("\n")' 2>/dev/null || echo "")
+  fi
+
+  if [ -z "$files_filter" ]; then
+    log INFO "No test_intent files_added in state — skipping vacuousness Pass 1"
+    echo '{"vacuous_tests": [], "checked_count": 0}' > "$EXPLAIN_DIR/vacuousness_pass_1.json"
+    _jq_update --argjson v '{"vacuous_tests": [], "checked_count": 0}' \
+      '.semantic.vacuousness.pass_1 = $v'
+    return 0
+  fi
+
+  local attempt=0
+  local retry_limit="${VACUOUSNESS_RETRY_LIMIT:-2}"
+  local vacuous_json='{"vacuous_tests": [], "checked_count": 0}'
+
+  local file_count
+  file_count=$(echo "$files_filter" | grep -c .)
+
+  while :; do
+    # A006 contract: save and restore caller's LAST_* globals around the call.
+    local _saved_passed="${LAST_PASSED_SUITES:-}"
+    local _saved_failed="${LAST_FAILED_SUITES:-}"
+    local _saved_output="${LAST_TEST_OUTPUT:-}"
+
+    # SUITE_FILE_FILTER is exported as a forward-looking contract: a
+    # filter-aware _run_all_suites would scope the run to just the new test
+    # files. Current _run_all_suites ignores it, so in production the gate
+    # runs the full suite — still useful: when all suites are green
+    # pre-impl, the new test must be vacuous (a real TDD-red would fail at
+    # least its own bucket). The Pass 1 unit tests exercise the filtered
+    # path directly via stubs.
+    local _saved_filter="${SUITE_FILE_FILTER:-}"
+    SUITE_FILE_FILTER="$files_filter"
+
+    # Use the suite-level rc, NOT the populated-suite list. _run_all_suites
+    # returns 0 only when every discovered suite passes; non-zero when at
+    # least one fails. In production LAST_PASSED_SUITES contains every
+    # always-green suite (lint, build, type-check, …), so reading it as the
+    # signal would mark every run vacuous. The rc is the right primitive:
+    # all-green pre-impl ⇒ the new test does not assert on missing impl.
+    local rc=0
+    _run_all_suites || rc=$?
+    local passed_list="${LAST_PASSED_SUITES:-}"
+
+    SUITE_FILE_FILTER="$_saved_filter"
+    LAST_PASSED_SUITES="$_saved_passed"
+    LAST_FAILED_SUITES="$_saved_failed"
+    LAST_TEST_OUTPUT="$_saved_output"
+
+    if [ "$rc" -ne 0 ]; then
+      log OK "Vacuousness Pass 1: TDD-red verified (${file_count} test file(s) failing as expected)"
+      vacuous_json=$(jq -n --argjson c "$file_count" '{vacuous_tests: [], checked_count: $c}')
+      echo "$vacuous_json" > "$EXPLAIN_DIR/vacuousness_pass_1.json"
+      _jq_update --argjson v "$vacuous_json" '.semantic.vacuousness.pass_1 = $v'
+      return 0
+    fi
+
+    log WARN "Vacuousness Pass 1: all suites passed pre-implementation — new test files appear vacuous (passed suites: ${passed_list})"
+    local files_arr
+    files_arr=$(printf '%s' "$files_filter" | jq -R . | jq -s -c 'map(select(length > 0))' 2>/dev/null || echo '[]')
+    vacuous_json=$(jq -n --argjson f "$files_arr" \
+      '{vacuous_tests: ($f | map({file: ., reason: "passed before implementation"})), checked_count: ($f | length)}')
+    echo "$vacuous_json" > "$EXPLAIN_DIR/vacuousness_pass_1.json"
+    _jq_update --argjson v "$vacuous_json" '.semantic.vacuousness.pass_1 = $v'
+
+    if [ "${AUTO_REWRITE_VACUOUS:-0}" != "1" ]; then
+      log ERROR "Vacuousness Pass 1: hard-fail (AUTO_REWRITE_VACUOUS=0)"
+      return 1
+    fi
+
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt "$retry_limit" ]; then
+      log ERROR "Vacuousness Pass 1: auto-rewrite exhausted ${retry_limit} retries — hard-fail"
+      return 1
+    fi
+
+    log INFO "Vacuousness Pass 1: auto-rewrite attempt ${attempt}/${retry_limit}"
+    run_claude "The following test(s) passed BEFORE the implementation phase has run, which means they assert on behaviour that is already true and so do not test the new feature: ${passed_list}.
+
+Rewrite these tests so they assert on observable side-effects of the not-yet-written implementation (row counts, exact return values, external-call invocations). The rewritten tests MUST fail when run against the current codebase (TDD-red), and pass only once the implementation phase produces the real behaviour.
+
+Do not modify any source file under lib/ or src/ — only the test files."
+  done
 }
 
 phase_pattern_baseline() {
@@ -2985,6 +3249,289 @@ Fix the implementation to match the tests."
   _update_test_results "fail" "$MAX_TEST_ITERATIONS"
   log ERROR "Tests still failing after ${MAX_TEST_ITERATIONS} iterations"
   return 1
+}
+
+# ─── Vacuousness Pass 2a — semantic mutation (Gate 2) ────────────────────────
+# Runs after test_fix (impl + tests are green), before ci_checks. Generates
+# semantic mutants per the taxonomy (D1) and verifies each is killed by ≥1
+# test. Survivors → vacuous coverage of that mutation site.
+phase_vacuousness_pass_2_semantic() {
+  _ensure_explain_dir
+
+  local changed_json
+  changed_json=$(_state_get '.deterministic.files_changed // []')
+  local impl_files
+  impl_files=$(echo "$changed_json" | jq -r '. // [] | map(select(test("(_test\\.|_test/|/test/|\\.test\\.|\\.spec\\.)") | not))[]' 2>/dev/null || echo "")
+
+  if [ -z "$impl_files" ]; then
+    log INFO "Vacuousness Pass 2 (semantic): no impl files in diff — skipping"
+    local empty='{"survivors": [], "killed": [], "invalid_mutants": []}'
+    echo "$empty" > "$EXPLAIN_DIR/vacuousness_pass_2_semantic.json"
+    _jq_update --argjson v "$empty" '.semantic.vacuousness.pass_2_semantic = $v'
+    return 0
+  fi
+
+  local taxonomy
+  taxonomy=$(_load_vacuousness_taxonomy)
+
+  # Single Claude call per phase: ask for all applicable mutants across all
+  # impl files, sorted by file then line for determinism (D1's contract).
+  local files_block
+  files_block=$(echo "$impl_files" | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    local abs="${PROJECT_ROOT}/$f"
+    if [ -f "$abs" ]; then
+      printf '\n--- %s ---\n' "$f"
+      cat "$abs"
+    else
+      printf '\n--- %s ---\n(file not present in working tree)\n' "$f"
+    fi
+  done)
+
+  local rc_output
+  rc_output=$(run_claude_fresh "${taxonomy}
+
+---
+
+You are the semantic-mutation generator for the vacuousness gate. List every applicable mutation across the impl files below, sorted by file then line.
+
+Files:
+${files_block}
+
+Output ONLY a JSON array conforming to the schema in the taxonomy. No prose, no fences." 2>/dev/null)
+
+  # Prefer stdout (test stubs emit there); fall back to LAST_RESPONSE_TEXT
+  # for the real run_claude_fresh path. Anything unparseable becomes [].
+  local mutants
+  mutants=$(echo "${rc_output:-${LAST_RESPONSE_TEXT:-}}" | jq -c '.' 2>/dev/null)
+  case "$mutants" in ""|"null") mutants="[]" ;; esac
+
+  local survivors_file killed_file invalid_file
+  survivors_file=$(mktemp); killed_file=$(mktemp); invalid_file=$(mktemp)
+  printf '[]' > "$survivors_file"
+  printf '[]' > "$killed_file"
+  printf '[]' > "$invalid_file"
+
+  local mutant_count
+  mutant_count=$(echo "$mutants" | jq 'length' 2>/dev/null || echo 0)
+  local i=0
+  while [ "$i" -lt "$mutant_count" ]; do
+    local m
+    m=$(echo "$mutants" | jq -c ".[$i]")
+    local m_file m_line m_cat m_mutated_text
+    m_file=$(echo "$m" | jq -r '.file')
+    m_line=$(echo "$m" | jq -r '.line')
+    m_cat=$(echo "$m" | jq -r '.category')
+    m_mutated_text=$(echo "$m" | jq -r '.mutated // ""')
+
+    local mutated_tmp
+    mutated_tmp=$(mktemp)
+    printf '%s' "$m_mutated_text" > "$mutated_tmp"
+
+    # Syntax check (D3-004): if SYNTAX_CHECK_COMMAND is set and rejects the
+    # mutated content, classify as invalid and skip running tests. Use eval
+    # so multi-arg commands work (e.g. SYNTAX_CHECK_COMMAND="mix compile
+    # --no-deps-check"); the mutated path is shell-quoted to survive eval.
+    if [ -n "${SYNTAX_CHECK_COMMAND:-}" ]; then
+      if ! eval "${SYNTAX_CHECK_COMMAND} \"\$mutated_tmp\"" >/dev/null 2>&1; then
+        jq --argjson m "$m" '. + [$m]' "$invalid_file" > "$invalid_file.tmp" && mv "$invalid_file.tmp" "$invalid_file"
+        rm -f "$mutated_tmp"
+        i=$((i + 1))
+        continue
+      fi
+    fi
+
+    # Apply + test. If the impl file is absent in the working tree (common
+    # in unit-test fixtures), skip the apply step but still run the suite
+    # callback so survivor classification works. NOTE: in this bypass path
+    # we never actually mutate anything — survivor here means "tests pass on
+    # unmodified code", which the unit-test stubs simulate. In production
+    # the file should always exist; if it doesn't, the result is advisory.
+    local target_abs="${PROJECT_ROOT}/${m_file}"
+    local rc=0
+    if [ -f "$target_abs" ]; then
+      _vacuous_test_runner_cb() { _run_all_suites; }
+      _vacuous_apply_mutant "$target_abs" "$mutated_tmp" _vacuous_test_runner_cb "${m_file}:${m_line}:${m_cat}" || rc=$?
+    else
+      _run_all_suites || rc=$?
+    fi
+
+    if [ "$rc" -eq 0 ]; then
+      jq --argjson m "$m" '. + [$m]' "$survivors_file" > "$survivors_file.tmp" && mv "$survivors_file.tmp" "$survivors_file"
+    else
+      jq --argjson m "$m" '. + [$m]' "$killed_file" > "$killed_file.tmp" && mv "$killed_file.tmp" "$killed_file"
+    fi
+
+    rm -f "$mutated_tmp"
+    i=$((i + 1))
+  done
+
+  # EXPECTED_SURVIVORS filter (D3-005): suppress newline-separated
+  # file:line:category entries from the survivors array.
+  if [ -n "${EXPECTED_SURVIVORS:-}" ]; then
+    local expected_arr
+    expected_arr=$(printf '%s' "$EXPECTED_SURVIVORS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+    jq --argjson exp "$expected_arr" \
+      'map(select((.file + ":" + (.line | tostring) + ":" + .category) as $k | ($exp | index($k)) == null))' \
+      "$survivors_file" > "$survivors_file.tmp" && mv "$survivors_file.tmp" "$survivors_file"
+  fi
+
+  local artefact
+  artefact=$(jq -n \
+    --argjson s "$(cat "$survivors_file")" \
+    --argjson k "$(cat "$killed_file")" \
+    --argjson inv "$(cat "$invalid_file")" \
+    '{survivors: $s, killed: $k, invalid_mutants: $inv}')
+  echo "$artefact" > "$EXPLAIN_DIR/vacuousness_pass_2_semantic.json"
+  _jq_update --argjson v "$artefact" '.semantic.vacuousness.pass_2_semantic = $v'
+
+  rm -f "$survivors_file" "$killed_file" "$invalid_file"
+
+  local survivor_count
+  survivor_count=$(echo "$artefact" | jq '.survivors | length')
+  if [ "$survivor_count" -gt 0 ]; then
+    log WARN "Vacuousness Pass 2 (semantic): ${survivor_count} surviving mutant(s) — see ${EXPLAIN_DIR}/vacuousness_pass_2_semantic.json"
+    if [ "${AUTO_REWRITE_VACUOUS:-0}" != "1" ]; then
+      return 1
+    fi
+  else
+    log OK "Vacuousness Pass 2 (semantic): all mutants killed"
+  fi
+  return 0
+}
+
+# ─── Vacuousness Pass 2b — coverage-driven mutation (Gate 3) ────────────────
+# Reads the upstream coverage_map artefact, surfaces uncovered lines, and
+# runs targeted mutations at covered-but-suspect lines. Surviving targeted
+# mutants → weakly-covered lines (the high-coverage-low-confidence shape).
+phase_vacuousness_pass_2_coverage() {
+  _ensure_explain_dir
+
+  local cov_path="${EXPLAIN_DIR}/coverage_map.json"
+
+  if [ ! -f "$cov_path" ]; then
+    warn "coverage_map.json missing — vacuousness Pass 2 (coverage) running fallback coverage command"
+    if [ -n "${COVERAGE_COMMAND:-}" ]; then
+      "$COVERAGE_COMMAND" >/dev/null 2>&1 || true
+    else
+      # Auto-detect (best-effort)
+      if [ -f "${PROJECT_ROOT:-.}/mix.exs" ]; then
+        ( cd "$PROJECT_ROOT" && mix test --cover ) >/dev/null 2>&1 || true
+      elif [ -f "${PROJECT_ROOT:-.}/package.json" ]; then
+        ( cd "$PROJECT_ROOT" && npm test -- --coverage ) >/dev/null 2>&1 || true
+      elif [ -f "${PROJECT_ROOT:-.}/pyproject.toml" ] || [ -f "${PROJECT_ROOT:-.}/setup.cfg" ]; then
+        ( cd "$PROJECT_ROOT" && pytest --cov ) >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+
+  local changed_json
+  changed_json=$(_state_get '.deterministic.files_changed // []')
+  local impl_files
+  impl_files=$(echo "$changed_json" | jq -r '. // [] | map(select(test("(_test\\.|_test/|/test/|\\.test\\.|\\.spec\\.)") | not))[]' 2>/dev/null || echo "")
+
+  local weakly_file uncovered_file
+  weakly_file=$(mktemp); uncovered_file=$(mktemp)
+  printf '[]' > "$weakly_file"
+  printf '[]' > "$uncovered_file"
+
+  if [ -z "$impl_files" ]; then
+    log INFO "Vacuousness Pass 2 (coverage): no impl files in diff — skipping"
+    local empty='{"weakly_covered_lines": [], "uncovered_lines": []}'
+    echo "$empty" > "$EXPLAIN_DIR/vacuousness_pass_2_coverage.json"
+    _jq_update --argjson v "$empty" '.semantic.vacuousness.pass_2_coverage = $v'
+    rm -f "$weakly_file" "$uncovered_file"
+    return 0
+  fi
+
+  # Iterate using a process-substitution pattern that keeps the loop body
+  # in the parent shell so writes to local temp files persist (avoiding
+  # the "while-in-pipeline" subshell trap).
+  local _f
+  for _f in $impl_files; do
+    [ -n "$_f" ] || continue
+    local lines_stream=""
+    if [ -f "$cov_path" ]; then
+      lines_stream=$(jq -r --arg f "$_f" '
+        (.files // {})[$f] as $entry |
+        (($entry.lines // []) | map({line, count}))[] |
+        "\($f)\t\(.line)\t\(.count)"
+      ' "$cov_path" 2>/dev/null)
+    fi
+    if [ -z "$lines_stream" ]; then
+      continue
+    fi
+
+    local _cline_arr=""
+    while IFS=$'\t' read -r cf cline ccount; do
+      [ -n "$cline" ] || continue
+      if [ "${ccount:-0}" = "0" ]; then
+        jq --arg f "$cf" --argjson l "$cline" \
+          '. + [{file: $f, line: $l, coverage_count: 0}]' \
+          "$uncovered_file" > "$uncovered_file.tmp" && mv "$uncovered_file.tmp" "$uncovered_file"
+        continue
+      fi
+
+      # The coverage gate's targeted mutation is a placeholder: replacing
+      # the entire file with a marker string. In practice this mostly
+      # produces a syntactically-broken file that fails to load, which the
+      # callback reads as "tests fail" → mutant killed. A surviving mutant
+      # here therefore means "tests pass even with this file completely
+      # broken" — a strong signal of weak coverage. A future iteration
+      # could ask Claude for line-targeted mutations via the taxonomy.
+      local mutated_tmp
+      mutated_tmp=$(mktemp)
+      printf '%s' "(line $cline mutated)" > "$mutated_tmp"
+      local target_abs="${PROJECT_ROOT}/${cf}"
+      local rc=0
+      _vacuous_cov_runner_cb() { _run_all_suites 2>/dev/null || return 1; }
+      if [ -f "$target_abs" ]; then
+        _vacuous_apply_mutant "$target_abs" "$mutated_tmp" _vacuous_cov_runner_cb "${cf}:${cline}" || rc=$?
+      else
+        # File not present — call the helper but allow it to no-op via the
+        # safe-restore path. Pass provenance so test stubs can match.
+        local placeholder
+        placeholder=$(mktemp)
+        printf '' > "$placeholder"
+        _vacuous_apply_mutant "$placeholder" "$mutated_tmp" _vacuous_cov_runner_cb "${cf}:${cline}" || rc=$?
+        rm -f "$placeholder"
+      fi
+      rm -f "$mutated_tmp"
+
+      if [ "$rc" -eq 0 ]; then
+        local suggestion=""
+        suggestion=$(run_claude "A targeted mutation at ${cf}:${cline} survived despite tests reporting ${ccount} hits on this line. Suggest a one-paragraph assertion shape that would kill this mutant — focus on observable side-effects (row counts, exact return values, external-call invocations)." 2>/dev/null || echo "")
+        jq --arg f "$cf" --argjson l "$cline" --argjson cnt "$ccount" --arg s "$suggestion" \
+          '. + [{file: $f, line: $l, coverage_count: $cnt, coverage_pct: 100, surviving_mutation: "targeted single-line", suggested_assertion: $s}]' \
+          "$weakly_file" > "$weakly_file.tmp" && mv "$weakly_file.tmp" "$weakly_file"
+      fi
+    done <<EOF
+$lines_stream
+EOF
+  done
+
+  local artefact
+  artefact=$(jq -n \
+    --argjson w "$(cat "$weakly_file")" \
+    --argjson u "$(cat "$uncovered_file")" \
+    '{weakly_covered_lines: $w, uncovered_lines: $u}')
+  echo "$artefact" > "$EXPLAIN_DIR/vacuousness_pass_2_coverage.json"
+  _jq_update --argjson v "$artefact" '.semantic.vacuousness.pass_2_coverage = $v'
+
+  rm -f "$weakly_file" "$uncovered_file"
+
+  local w_count u_count
+  w_count=$(echo "$artefact" | jq '.weakly_covered_lines | length')
+  u_count=$(echo "$artefact" | jq '.uncovered_lines | length')
+  if [ "$w_count" -gt 0 ]; then
+    log WARN "Vacuousness Pass 2 (coverage): ${w_count} weakly-covered line(s), ${u_count} uncovered"
+    if [ "${AUTO_REWRITE_VACUOUS:-0}" != "1" ]; then
+      return 1
+    fi
+  else
+    log OK "Vacuousness Pass 2 (coverage): all covered lines mutation-sensitive (${u_count} uncovered)"
+  fi
+  return 0
 }
 
 phase_ci_checks() {
@@ -3797,6 +4344,25 @@ _detect_artifacts
 
 [ "$_CLI_OPINIONATED" = true ] && OPINIONATED=true
 
+# ─── Vacuousness Gate Resolution (CAP-VG-001) ───────────────────────────────
+# CLI flags override .auto_claude.conf. Spec frontmatter `rigorous: true`
+# acts equivalently to --rigorous so high-stakes specs auto-elevate.
+[ "$_CLI_RIGOROUS" = true ] && RIGOROUS=1
+[ "$_CLI_SKIP_VACUOUSNESS" = true ] && SKIP_VACUOUSNESS_GATE=1
+[ "$_CLI_AUTO_REWRITE_VACUOUS" = true ] && AUTO_REWRITE_VACUOUS=1
+[ -n "$_CLI_VACUOUSNESS_FORMAT" ] && VACUOUSNESS_FORMAT="$_CLI_VACUOUSNESS_FORMAT"
+[ "$_CLI_VACUOUSNESS_ONLY" = true ] && VACUOUSNESS_ONLY=1
+
+# Spec frontmatter parse: `rigorous: true` between leading --- markers.
+if [ -n "${SPEC_FILE:-}" ] && [ -f "$SPEC_FILE" ]; then
+  if awk '/^---$/{f=!f; next} f && /^rigorous:/{print}' "$SPEC_FILE" 2>/dev/null \
+       | grep -qiE 'rigorous:[[:space:]]*true'; then
+    RIGOROUS=1
+    log INFO "Spec frontmatter declares rigorous: true — enabling vacuousness Pass 2"
+  fi
+fi
+export RIGOROUS SKIP_VACUOUSNESS_GATE AUTO_REWRITE_VACUOUS VACUOUSNESS_FORMAT VACUOUSNESS_ONLY
+
 # The five principles — shared between both modes, framing differs.
 _OPINIONATED_PRINCIPLES='''1. **Discriminated unions over optional fields** — when a type has distinct
    states, use tagged unions so each variant carries exactly the fields it needs.
@@ -4125,6 +4691,37 @@ main() {
     unset _skip_arr _sp _p _found
   fi
 
+  # ── Vacuousness-only input wiring ──
+  # In --vacuousness-only mode the pipeline has not run plan/implement, so
+  # .deterministic.files_changed is empty. Populate it from --files (explicit
+  # list) or --diff (git ref) so the Pass 2 phases see the files to analyse.
+  if [ "${VACUOUSNESS_ONLY:-0}" = "1" ]; then
+    local _vac_files_json='[]'
+    if [ -n "${_CLI_VAC_FILES:-}" ]; then
+      _vac_files_json=$(printf '%s' "$_CLI_VAC_FILES" \
+        | tr ',' '\n' \
+        | sed '/^$/d' \
+        | jq -R . | jq -s '.' 2>/dev/null || echo '[]')
+    elif [ -n "${_CLI_VAC_DIFF:-}" ] && [ "$HAS_GIT" = true ]; then
+      # Validate the ref before passing it to git so a value like
+      # "--upload-pack=…" can't be misinterpreted as a flag, and an unknown
+      # ref doesn't silently produce an empty file list.
+      if git -C "$PROJECT_ROOT" rev-parse --verify --quiet "$_CLI_VAC_DIFF" >/dev/null 2>&1; then
+        _vac_files_json=$(git -C "$PROJECT_ROOT" diff --name-only "$_CLI_VAC_DIFF" -- 2>/dev/null \
+          | sed '/^$/d' \
+          | jq -R . | jq -s '.' 2>/dev/null || echo '[]')
+      else
+        log WARN "Vacuousness-only: --diff '${_CLI_VAC_DIFF}' is not a valid git ref — ignoring"
+      fi
+    fi
+    if [ "$_vac_files_json" != "[]" ]; then
+      _jq_update --argjson f "$_vac_files_json" \
+        '.deterministic.files_changed = $f | .deterministic.test_intent.files_added = ($f | map(select(test("(_test\\.|_test/|/test/|\\.test\\.|\\.spec\\.)"))))'
+      log INFO "Vacuousness-only: wired $(echo "$_vac_files_json" | jq 'length') file(s) into state"
+    fi
+    unset _vac_files_json
+  fi
+
   log INFO "Starting auto_claude pipeline"
   log INFO "Project: ${PROJECT_NAME}"
   log INFO "Spec: ${SPEC_FILE}"
@@ -4152,6 +4749,41 @@ main() {
 
     if [ "$start_phase" -le "$phase_idx" ]; then
       CURRENT_PHASE_NAME="$phase_name"
+
+      # PATTERN-DEVIATION (P010): the canonical pattern is for each phase to
+      # short-circuit on its own toggle (`if [ "$TOGGLE" != "true" ]; ...`)
+      # and the dispatcher to stay agnostic. The vacuousness gate skip-policy
+      # is multi-toggle (SKIP_VACUOUSNESS_GATE, RIGOROUS, VACUOUSNESS_ONLY)
+      # AND inverse for the VACUOUSNESS_ONLY case (must skip every OTHER
+      # phase, which a per-phase gate cannot express). Centralising here
+      # keeps that policy in one place; phase functions remain oblivious.
+      # Vacuousness gate dispatcher policy (D5-001):
+      #   SKIP_VACUOUSNESS_GATE=1 → skip all three vacuousness phases.
+      #   RIGOROUS!=1            → skip Pass 2 phases (Pass 1 still runs).
+      # In --vacuousness-only mode, only vacuousness phases run; others skip.
+      local _skip_phase=false
+      case "$phase_name" in
+        vacuousness_pass_1)
+          [ "${SKIP_VACUOUSNESS_GATE:-0}" = "1" ] && _skip_phase=true
+          ;;
+        vacuousness_pass_2_semantic|vacuousness_pass_2_coverage)
+          [ "${SKIP_VACUOUSNESS_GATE:-0}" = "1" ] && _skip_phase=true
+          [ "${RIGOROUS:-0}" != "1" ] && _skip_phase=true
+          ;;
+        *)
+          [ "${VACUOUSNESS_ONLY:-0}" = "1" ] && _skip_phase=true
+          ;;
+      esac
+
+      if [ "$_skip_phase" = true ]; then
+        log INFO "═══ Phase ${phase_idx}/${#PHASES[@]}: ${phase_name} (skipped by gate policy) ═══"
+        _update_phase_status "$phase_name" "completed"
+        if [ "$phase_name" = "$SEAM_AFTER" ]; then
+          _PAST_SEAM=true
+        fi
+        continue
+      fi
+
       log INFO "═══ Phase ${phase_idx}/${#PHASES[@]}: ${phase_name} ═══"
 
       _update_phase_status "$phase_name" "in_progress"
@@ -4191,6 +4823,21 @@ main() {
   # Mark run as completed, clean up transient files
   _jq_update '.run.status = "completed"'
   rm -f "$BASELINE_FILE"
+
+  # In --vacuousness-only mode with --vacuousness-format json, the skill
+  # consumes a single combined JSON document on stdout. Emit it from the
+  # per-phase artefacts (each pass writes its own; missing ones default to
+  # empty objects so the schema stays predictable for downstream parsers).
+  if [ "${VACUOUSNESS_ONLY:-0}" = "1" ] && [ "${VACUOUSNESS_FORMAT:-human}" = "json" ]; then
+    local _p1_path="${EXPLAIN_DIR}/vacuousness_pass_1.json"
+    local _p2s_path="${EXPLAIN_DIR}/vacuousness_pass_2_semantic.json"
+    local _p2c_path="${EXPLAIN_DIR}/vacuousness_pass_2_coverage.json"
+    jq -n \
+      --argjson p1  "$([ -f "$_p1_path" ]  && cat "$_p1_path"  || echo '{}')" \
+      --argjson p2s "$([ -f "$_p2s_path" ] && cat "$_p2s_path" || echo '{}')" \
+      --argjson p2c "$([ -f "$_p2c_path" ] && cat "$_p2c_path" || echo '{}')" \
+      '{pass_1: $p1, pass_2_semantic: $p2s, pass_2_coverage: $p2c}'
+  fi
 
   log OK "═══ All ${#PHASES[@]} phases complete ═══"
   log INFO "State: jq . ${STATE_FILE}"

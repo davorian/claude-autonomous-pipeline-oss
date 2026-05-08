@@ -4,16 +4,17 @@ Reusable autonomous feature pipeline using Claude as engine.
 
 ## Pipeline
 
-13-phase pipeline split into two blocks at a configurable seam:
+16-phase pipeline split into two blocks at a configurable seam:
 
 **Authoring block** (single Claude conversation):
-`plan` → `decisions` → `test_intent` → `pattern_baseline` → `implement` → `test_fix` → `ci_checks`
+`plan` → `decisions` → `test_intent` → `vacuousness_pass_1` → `pattern_baseline` → `implement` → `test_fix` → `vacuousness_pass_2_semantic` → `vacuousness_pass_2_coverage` → `ci_checks`
 
 **Quality block** (fresh sessions per phase):
 `impact` → `skill_chain` → `loc_enforcement` → `fresh_review` → `doc_update` → `final`
 
 Key features:
 - **TDD flow** — `test_intent` writes failing tests before implementation; `implement` makes them pass (`TDD_ENABLED=true`)
+- **Vacuousness gate** (CAP-VG-001) — Gate 1 verifies the new tests are TDD-red before `implement` runs; Gates 2 + 3 (opt-in via `--rigorous`) generate semantic + coverage-driven mutants and require each to be killed by ≥1 test. See `docs/vacuousness_taxonomy.md` and `skills/check-vacuousness/SKILL.md`.
 - **Pattern conformance** — `pattern_baseline` catalogues existing patterns; `skill_chain` enforces conformance (`PATTERN_CONFORMANCE=true`)
 - **Ownership boundaries** — `worktree_auto_claude` writes `.auto_claude_ownership.json` to constrain each parallel instance to its owned files
 - **Explainability** — `decisions` phase emits decision manifests to `.auto_claude_explain/`
@@ -44,6 +45,13 @@ tests/
 
 # Isolated worktree run
 ~/bin/worktree_auto_claude path/to/spec.md
+
+# Run with full vacuousness gate (Gates 1 + 2 + 3)
+~/bin/auto_claude --rigorous path/to/spec.md
+
+# Ad-hoc vacuousness check on existing files (no spec / no implementation)
+~/bin/auto_claude --vacuousness-only --files path/to/test.ex,path/to/other_test.ex
+~/bin/auto_claude --vacuousness-only --diff main..HEAD --vacuousness-format json
 ```
 
 Requires `.auto_claude.conf` in the project root. See `conf/` for examples and `docs/auto_claude.md` for full documentation.
