@@ -738,10 +738,29 @@ _tier_for_iteration() {
 #
 # run_claude_fresh — Starts a new conversation (for quality phases).
 
+# _build_full_prompt — Assemble the full prompt sent to claude.
+#   Prepends AUTO_CLAUDE_PROMPT_PREAMBLE (if set and non-empty) followed by
+#   a blank line, then the phase prompt, then NO_QUESTIONS. When the env
+#   var is unset or empty, output is byte-identical to the pre-preamble
+#   "${prompt} ${NO_QUESTIONS}" form — full backwards compatibility.
+#
+#   Used by sme-ab-run to inject SME priming context without modifying
+#   any phase prompt directly.
+_build_full_prompt() {
+  local prompt="$1"
+  local preamble="${AUTO_CLAUDE_PROMPT_PREAMBLE:-}"
+  if [ -n "$preamble" ]; then
+    printf '%s\n\n%s %s' "$preamble" "$prompt" "${NO_QUESTIONS}"
+  else
+    printf '%s %s' "$prompt" "${NO_QUESTIONS}"
+  fi
+}
+
 _invoke_claude() {
   local prompt="$1"
   shift
-  local full_prompt="${prompt} ${NO_QUESTIONS}"
+  local full_prompt
+  full_prompt=$(_build_full_prompt "$prompt")
 
   # --dangerously-skip-permissions is required because the pipeline is autonomous.
   # Without it, claude prompts for tool approval, but since output is captured
@@ -3454,7 +3473,7 @@ _files_match_glob() {
     # JSON array — extract quoted strings
     while IFS= read -r g; do
       globs+=("$g")
-    done < <(echo "$globs_raw" | tr -d '[]' | tr ',' '\n' | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//' | grep -v '^$')
+    done < <(echo "$globs_raw" | tr -d '[]' | tr ',' '\n' | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//' | { grep -v '^$' || true; })
   elif [ -n "$globs_raw" ]; then
     globs+=("$globs_raw")
   fi
@@ -3488,8 +3507,9 @@ _files_match_glob() {
 # Usage: _mdc_field "fieldname" < file.mdc
 _mdc_field() {
   local field="$1"
-  # Read between first and second ---, extract the field
-  sed -n '/^---$/,/^---$/p' | grep "^${field}:" | sed "s/^${field}:[[:space:]]*//"
+  # Read between first and second ---, extract the field.
+  # `|| true` on grep so a missing field doesn't trip the ERR trap under pipefail.
+  sed -n '/^---$/,/^---$/p' | { grep "^${field}:" || true; } | sed "s/^${field}:[[:space:]]*//"
 }
 
 # Load repo-specific review rules from .cursor/BUGBOT.md and .cursor/rules/**/*.mdc
