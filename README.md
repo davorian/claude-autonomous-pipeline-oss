@@ -26,6 +26,7 @@ bin/
   auto_claude              # Main pipeline script (~4000 lines)
   worktree_auto_claude     # Git worktree wrapper for isolated parallel runs
   auto_claude_original     # Pre-refactor backup
+  new-claude-gate          # Scaffold a memory+skill+hook gate trio for Claude Code
 conf/
   platform.auto_claude.conf    # Multiverse platform config
   aurora.auto_claude.conf      # Multiverse aurora config
@@ -33,9 +34,38 @@ conf/
 docs/
   auto_claude.md                       # Pipeline documentation
   auto-claude-explainability-sketch.md # Explainability proposal
+  claude-gates-pattern.md              # Memory+skill+hook pattern (companion to new-claude-gate)
+skills/
+  check-vacuousness/       # Ad-hoc vacuousness gate
+  new-gate/                # Interactive scaffolding skill (front-end for new-claude-gate)
 tests/
   test_auto_claude_*.sh    # Pipeline test scripts
+  test_new_claude_gate.sh  # Scaffold smoke test (21 assertions)
 ```
+
+### Claude Code gates (memory + skill + hook trio)
+
+In addition to the autonomous pipeline, this repo packages a **portable scaffold** for adding behavioural rules to a Claude Code installation. Every rule consists of three artefacts plus a single-use flag that glues them together:
+
+- **Memory rule** (markdown in `~/.claude/memory/`) — when to invoke the skill, why the rule exists.
+- **Skill** (markdown in `~/.claude/skills/<name>/SKILL.md`) — does the actual work, touches the gate flag, runs the gated tool.
+- **Hook** (shell script in `~/.claude/hooks/<name>-gate.sh`, wired in `~/.claude/settings.json`) — PreToolUse block on the gated tools unless the flag is set.
+
+Adopt the pattern in a new client/repo:
+
+```bash
+# scripted
+bin/new-claude-gate \
+  --name pii-redact \
+  --desc 'Redact PII from outbound messages' \
+  --why 'Customer 2026-04-22: PII leaked in a Slack DM' \
+  --gated 'mcp__slack-multiverse__slack_send_message,Bash:gh pr comment'
+
+# interactive (from inside Claude Code)
+/new-gate
+```
+
+See `docs/claude-gates-pattern.md` for the design rationale, anti-patterns, and reference implementations.
 
 ## Usage
 
