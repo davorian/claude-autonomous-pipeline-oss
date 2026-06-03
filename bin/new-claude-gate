@@ -1,0 +1,513 @@
+#!/bin/bash
+# new-claude-gate — Scaffold a memory + skill + hook trio (single-flag handoff)
+#
+# Generates the four artefacts that compose a behavioural gate for Claude Code:
+#
+#   1. ~/.claude/memory/feedback_<name>.md       (memory rule — when to invoke)
+#   2. ~/.claude/skills/<name>/SKILL.md          (skill — does the work)
+#   3. ~/.claude/hooks/<name>-gate.sh            (hook — enforces compliance)
+#   4. ~/.claude/settings.json                   (patched — wires the hook)
+#
+# Plus an index entry in ~/.claude/memory/MEMORY.md.
+#
+# Pattern reference:
+#   ~/.claude/skills/short/PATTERN.md (canonical)
+#   docs/claude-gates-pattern.md (this repo)
+#
+# Usage:
+#   new-claude-gate --name <slug> [--gated <list>] [--why <text>] [--desc <text>] [...]
+#   new-claude-gate                              # interactive prompts for missing fields
+#
+# Examples:
+#   new-claude-gate --name short-drafts --gated 'mcp__slack-multiverse__slack_send_message,Bash:gh pr comment' \
+#       --why 'reviewer complained messages too long' --desc 'paraphrase before sending'
+#   new-claude-gate --name pii-redact --gated 'Bash:gh pr comment,Bash:gh api -X POST'
+
+set -Eeuo pipefail
+
+# ----------------------------------------------------------------------------
+# defaults
+# ----------------------------------------------------------------------------
+TARGET_DIR="${HOME}/.claude"
+DRY_RUN=false
+FORCE=false
+NAME=""
+DESC=""
+WHY=""
+GATED_RAW=""
+FLAG_NAME=""
+SKIP_SETTINGS=false
+SKIP_MEMORY_INDEX=false
+
+# ----------------------------------------------------------------------------
+# arg parsing
+# ----------------------------------------------------------------------------
+usage() {
+  cat <<'USAGE'
+Usage: new-claude-gate [flags]
+
+Required (will prompt interactively if omitted):
+  --name <slug>          kebab-case rule name (e.g. short-drafts)
+  --gated <list>         comma-separated MCP tool names and/or Bash:<pattern> entries
+                         e.g. 'mcp__slack-multiverse__slack_send_message,Bash:gh pr comment'
+                         Bash:<pattern> values become regex alternates in the hook.
+  --why <text>           one-line motivation (the incident or preference)
+  --desc <text>          one-line skill description (used in skill frontmatter)
+
+Optional:
+  --flag-name <slug>     /tmp flag filename (default: claude-<name>.flag)
+  --target-dir <path>    base dir (default: ~/.claude)
+  --skip-settings        do not patch settings.json (you'll wire manually)
+  --skip-memory-index    do not append to MEMORY.md (you'll add manually)
+  --dry-run              print files without writing
+  --force                overwrite existing files
+  -h, --help             show this help
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name)            NAME="$2"; shift 2 ;;
+    --desc)            DESC="$2"; shift 2 ;;
+    --why)             WHY="$2"; shift 2 ;;
+    --gated)           GATED_RAW="$2"; shift 2 ;;
+    --flag-name)       FLAG_NAME="$2"; shift 2 ;;
+    --target-dir)      TARGET_DIR="$2"; shift 2 ;;
+    --skip-settings)   SKIP_SETTINGS=true; shift ;;
+    --skip-memory-index) SKIP_MEMORY_INDEX=true; shift ;;
+    --dry-run)         DRY_RUN=true; shift ;;
+    --force)           FORCE=true; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    *) echo "unknown flag: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+# ----------------------------------------------------------------------------
+# interactive prompts for missing required fields
+# ----------------------------------------------------------------------------
+prompt() {
+  local var_name="$1"; local question="$2"
+  local current_val
+  current_val=$(eval "printf '%s' \"\$$var_name\"")
+  if [[ -z "$current_val" ]]; then
+    printf '%s: ' "$question" >&2
+    local answer
+    read -r answer
+    eval "$var_name=\$answer"
+  fi
+}
+
+prompt NAME      "Rule name (kebab-case, e.g. short-drafts)"
+prompt DESC      "Skill description (one line, used in /skill help)"
+prompt WHY       "Why does this rule exist? (one line — quote a reviewer or describe the incident)"
+prompt GATED_RAW "Gated tools (comma-separated; MCP tool names and/or Bash:<regex> patterns)"
+
+# ----------------------------------------------------------------------------
+# validation
+# ----------------------------------------------------------------------------
+if ! [[ "$NAME" =~ ^[a-z][a-z0-9-]*$ ]]; then
+  echo "ERROR: --name must be kebab-case (lowercase letters/digits/hyphens, starting with a letter): got '$NAME'" >&2
+  exit 2
+fi
+
+[[ -z "$FLAG_NAME" ]] && FLAG_NAME="claude-${NAME}.flag"
+FLAG_PATH="/tmp/${FLAG_NAME}"
+
+if [[ -z "$DESC" ]]; then echo "ERROR: --desc is required" >&2; exit 2; fi
+if [[ -z "$WHY"  ]]; then echo "ERROR: --why is required" >&2; exit 2; fi
+if [[ -z "$GATED_RAW" ]]; then echo "ERROR: --gated is required (at least one MCP tool name or Bash:<pattern>)" >&2; exit 2; fi
+
+command -v jq >/dev/null || { echo "ERROR: jq is required" >&2; exit 1; }
+
+# ----------------------------------------------------------------------------
+# parse --gated into MCP tool list and Bash regex parts
+# ----------------------------------------------------------------------------
+MCP_TOOLS=()
+BASH_PATTERNS=()
+IFS=',' read -r -a GATED_PARTS <<< "$GATED_RAW"
+for part in "${GATED_PARTS[@]}"; do
+  part="$(printf '%s' "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [[ -z "$part" ]] && continue
+  if [[ "$part" == Bash:* ]]; then
+    BASH_PATTERNS+=("${part#Bash:}")
+  else
+    MCP_TOOLS+=("$part")
+  fi
+done
+
+# Build matcher pipe-list for settings.json (always include Bash if there are bash patterns).
+MATCHER_PARTS=()
+(( ${#MCP_TOOLS[@]} > 0 )) && MATCHER_PARTS=("${MCP_TOOLS[@]}")
+(( ${#BASH_PATTERNS[@]} > 0 )) && MATCHER_PARTS+=("Bash")
+MATCHER_PIPE="$(IFS='|'; echo "${MATCHER_PARTS[*]}")"
+
+if [[ -z "$MATCHER_PIPE" ]]; then
+  echo "ERROR: --gated produced an empty matcher. Provide at least one MCP tool name or Bash:<pattern>." >&2
+  exit 2
+fi
+
+# Build the hook's case-block fragments using explicit per-line construction.
+# These strings are concatenated verbatim into the hook script — they must contain
+# the LITERAL shell code the hook will execute (i.e. unescaped $VAR references).
+
+MCP_CASE_BLOCK=""
+if (( ${#MCP_TOOLS[@]} > 0 )); then
+  # bash case-pattern alternatives — `tool1|tool2|tool3)`
+  MCP_CASE_BLOCK="  $(IFS='|'; echo "${MCP_TOOLS[*]}"))"$'\n'
+  MCP_CASE_BLOCK+="    GATED=true"$'\n'
+  MCP_CASE_BLOCK+="    ;;"
+fi
+
+BASH_CASE_BLOCK=""
+if (( ${#BASH_PATTERNS[@]} > 0 )); then
+  # Single OR-joined regex from the patterns — embedded as a single-quoted shell
+  # string in the hook so no further escaping is needed at hook-runtime.
+  BASH_REGEX="$(IFS='|'; echo "${BASH_PATTERNS[*]}")"
+  # Patterns containing single quotes would break the single-quoted embedding;
+  # warn and fall through to skipping. (gh-shaped commands don't use single quotes.)
+  if [[ "$BASH_REGEX" == *"'"* ]]; then
+    echo "ERROR: Bash patterns must not contain single quotes (got: $BASH_REGEX)" >&2
+    exit 2
+  fi
+  BASH_CASE_BLOCK="  Bash)"$'\n'
+  BASH_CASE_BLOCK+="    CMD=\$(printf '%s' \"\$INPUT_JSON\" | jq -r '.tool_input.command // \"\"')"$'\n'
+  BASH_CASE_BLOCK+="    PATTERN='${BASH_REGEX}'"$'\n'
+  BASH_CASE_BLOCK+="    if printf '%s' \"\$CMD\" | grep -qE \"\$PATTERN\"; then"$'\n'
+  BASH_CASE_BLOCK+="      GATED=true"$'\n'
+  BASH_CASE_BLOCK+="    fi"$'\n'
+  BASH_CASE_BLOCK+="    ;;"
+fi
+
+# ----------------------------------------------------------------------------
+# derived paths
+# ----------------------------------------------------------------------------
+MEMORY_FILE="${TARGET_DIR}/memory/feedback_${NAME//-/_}.md"
+SKILL_DIR="${TARGET_DIR}/skills/${NAME}"
+SKILL_FILE="${SKILL_DIR}/SKILL.md"
+HOOK_FILE="${TARGET_DIR}/hooks/${NAME}-gate.sh"
+SETTINGS_FILE="${TARGET_DIR}/settings.json"
+MEMORY_INDEX="${TARGET_DIR}/memory/MEMORY.md"
+
+# ----------------------------------------------------------------------------
+# pre-flight: check for collisions
+# ----------------------------------------------------------------------------
+collide=()
+for f in "$MEMORY_FILE" "$SKILL_FILE" "$HOOK_FILE"; do
+  [[ -e "$f" ]] && collide+=("$f")
+done
+
+if (( ${#collide[@]} > 0 )) && ! $FORCE; then
+  echo "ERROR: file(s) already exist (use --force to overwrite):" >&2
+  printf '  %s\n' "${collide[@]}" >&2
+  exit 1
+fi
+
+# ----------------------------------------------------------------------------
+# render templates
+# ----------------------------------------------------------------------------
+
+# Pre-compute optional sections as variables (avoids fragile $(...) inside heredocs).
+# Under `set -u`, "${arr[@]}" on an empty array errors in bash 3.x; the `+`
+# expansion guards against that — only iterates if the array has elements.
+SCOPE_LINES=""
+for t in ${MCP_TOOLS[@]+"${MCP_TOOLS[@]}"};  do SCOPE_LINES+="- \`${t}\`"$'\n'; done
+for p in ${BASH_PATTERNS[@]+"${BASH_PATTERNS[@]}"}; do SCOPE_LINES+="- Bash commands matching: \`${p}\`"$'\n'; done
+
+SKILL_DEST_LINES=""
+if (( ${#MCP_TOOLS[@]} > 0 )); then
+  SKILL_DEST_LINES+="**MCP tools gated:**"$'\n'
+  for t in ${MCP_TOOLS[@]+"${MCP_TOOLS[@]}"}; do SKILL_DEST_LINES+="- \`${t}\`"$'\n'; done
+fi
+if (( ${#BASH_PATTERNS[@]} > 0 )); then
+  [[ -n "$SKILL_DEST_LINES" ]] && SKILL_DEST_LINES+=$'\n'
+  SKILL_DEST_LINES+="**Bash patterns gated (regex):**"$'\n'
+  for p in "${BASH_PATTERNS[@]}"; do SKILL_DEST_LINES+="- \`${p}\`"$'\n'; done
+fi
+
+render_memory() {
+  cat <<EOF
+---
+name: ${NAME}
+description: ${DESC}
+metadata:
+  type: feedback
+---
+
+Before performing any gated operation, invoke the \`/${NAME}\` skill first.
+
+**Why:** ${WHY}
+
+**How to apply:**
+
+1. Prepare whatever the skill needs (typically the long-form artifact at a tempfile path the skill reads).
+2. Invoke \`/${NAME}\` — the skill does the actual work and touches the gate flag.
+3. The skill calls the gated tool immediately after touching \`${FLAG_PATH}\`.
+4. \`${HOOK_FILE}\` (PreToolUse) verifies the flag — blocks if missing, consumes if present.
+
+**Scope (where this rule fires):**
+${SCOPE_LINES}
+**Where this rule does NOT fire:**
+- Internal tool use (Read, Edit, Write, etc.) outside the gated set.
+- Direct conversational replies to the user (not tool calls).
+- Add more exclusions specific to this rule.
+
+**Don't game the rule:** if the action seems exempt, run the skill anyway. The flag is needed regardless; exempt cases still get the side-by-side and stay auditable. The hook bypass (\`touch ${FLAG_PATH}\` directly) exists for genuinely no-op cases, not for general convenience.
+
+**Related:** \`~/.claude/skills/${NAME}/SKILL.md\` (the skill), \`~/.claude/hooks/${NAME}-gate.sh\` (the hook), \`~/.claude/skills/short/PATTERN.md\` (the portable trio recipe).
+EOF
+}
+
+render_skill() {
+  cat <<EOF
+---
+description: ${DESC}
+argument-hint: "[flags]"
+---
+
+# /${NAME}
+
+You are about to perform a gated operation. This skill is the forced pause to produce the required artefact and bless the send.
+
+> **Why this gate exists:** ${WHY}
+
+## Pre-condition
+
+The skill expects input at \`/tmp/claude-${NAME}-input.md\` (or wherever the rule defines). Write it before invoking, then re-invoke the skill if missing.
+
+\`\`\`bash
+cat > /tmp/claude-${NAME}-input.md <<INPUT_EOF
+your input here
+INPUT_EOF
+\`\`\`
+
+## What to produce
+
+1. Artifact A — the version you would otherwise produce by default. Describe.
+2. Artifact B — the version this gate enforces. Describe its constraints.
+
+Display both for the user when applicable.
+
+## Modes (flag arguments)
+
+- **No flag** (default) — interactive.
+- **\`--auto\`** — auto-pick the gate-favoured option.
+
+## The flag handoff (CRITICAL)
+
+Immediately before the gated tool call, run:
+
+\`\`\`bash
+touch ${FLAG_PATH}
+\`\`\`
+
+The PreToolUse hook \`${NAME}-gate.sh\` consumes this flag on the next gated call. **Single-use** — one tool call per touch.
+
+If the gated tool call is via **Bash**, put the \`touch\` and the gated command in **separate** Bash tool invocations — a single \`touch ... && cmd\` line is read as one command by the hook and gated before the touch fires.
+
+## Gated destinations
+
+${SKILL_DEST_LINES}
+## After
+
+Clean up any tempfiles you wrote.
+
+## Edge cases
+
+- Document cases where the transform produces near-identical output. Run the skill anyway; the flag is needed.
+- Document any genuine bypass cases that warrant \`touch ${FLAG_PATH}\` directly.
+
+## Related
+
+- Memory rule: \`~/.claude/memory/feedback_${NAME//-/_}.md\`
+- Hook: \`~/.claude/hooks/${NAME}-gate.sh\`
+- Pattern: \`~/.claude/skills/short/PATTERN.md\`
+EOF
+}
+
+render_hook() {
+  # Build the hook content with explicit concatenation to keep full control
+  # over what gets evaluated vs left literal. Variables interpolate at build
+  # time; runtime hook code uses single-quotes around literal $ refs.
+  local NAME_UPPER
+  NAME_UPPER=$(printf '%s' "$NAME" | tr '[:lower:]-' '[:upper:]_')
+  local out=""
+  out+="#!/usr/bin/env bash"$'\n'
+  out+="# ${NAME}-gate — PreToolUse hook for the ${NAME} rule."$'\n'
+  out+="#"$'\n'
+  out+="# Blocks gated tool calls unless the /${NAME} skill has set ${FLAG_PATH}"$'\n'
+  out+="# immediately before the call. The flag is single-use — this hook consumes"$'\n'
+  out+="# it on the matched call."$'\n'
+  out+="#"$'\n'
+  out+="# Rationale: ${MEMORY_FILE}"$'\n'
+  out+="# Skill: ${SKILL_FILE}"$'\n'
+  out+="# Pattern: ~/.claude/skills/short/PATTERN.md"$'\n'
+  out+="#"$'\n'
+  out+="# Wiring: ${SETTINGS_FILE} PreToolUse, matcher: ${MATCHER_PIPE}"$'\n'
+  out+=$'\n'
+  out+="set -uo pipefail"$'\n'
+  out+=$'\n'
+  out+="FLAG=${FLAG_PATH}"$'\n'
+  out+=$'\n'
+  out+='INPUT_JSON=$(cat)'$'\n'
+  out+='TOOL_NAME=$(printf '"'"'%s'"'"' "$INPUT_JSON" | jq -r '"'"'.tool_name // empty'"'"')'$'\n'
+  out+=$'\n'
+  out+="# --- per-tool scoping --------------------------------------------------------"$'\n'
+  out+="GATED=false"$'\n'
+  out+=$'\n'
+  out+='case "$TOOL_NAME" in'$'\n'
+  [[ -n "$MCP_CASE_BLOCK"   ]] && out+="${MCP_CASE_BLOCK}"$'\n'
+  [[ -n "$BASH_CASE_BLOCK"  ]] && out+="${BASH_CASE_BLOCK}"$'\n'
+  out+="esac"$'\n'
+  out+=$'\n'
+  out+='if ! $GATED; then'$'\n'
+  out+="  exit 0"$'\n'
+  out+="fi"$'\n'
+  out+=$'\n'
+  out+="# --- flag check --------------------------------------------------------------"$'\n'
+  out+='if [[ -f "$FLAG" ]]; then'$'\n'
+  out+='  rm -f "$FLAG"   # single-use; consume'$'\n'
+  out+="  exit 0"$'\n'
+  out+="fi"$'\n'
+  out+=$'\n'
+  out+="# --- blocked: emit remediation ----------------------------------------------"$'\n'
+  # The remediation message itself — use a quoted heredoc so $FLAG stays literal.
+  out+="cat >&2 <<'GATE_MSG'"$'\n'
+  out+="${NAME_UPPER} GATE blocked this tool call."$'\n'
+  out+=$'\n'
+  out+="${WHY}"$'\n'
+  out+=$'\n'
+  out+="Before re-issuing:"$'\n'
+  out+="  1. Prepare any required input (typically: write the long-form artifact to"$'\n'
+  out+="     /tmp/claude-${NAME}-input.md or whatever the skill expects)."$'\n'
+  out+="  2. Invoke /${NAME} — the skill produces the artefact pair, touches the flag,"$'\n'
+  out+="     then re-calls this gated tool."$'\n'
+  out+="  3. The flag is single-use — this hook consumes it on the matched call."$'\n'
+  out+=$'\n'
+  out+="Memory rule: ${MEMORY_FILE}"$'\n'
+  out+="Skill: ${SKILL_FILE}"$'\n'
+  out+="Flag path: ${FLAG_PATH}"$'\n'
+  out+=$'\n'
+  out+="Bypass (only for genuinely exempt cases):"$'\n'
+  out+="  Run Bash:  touch ${FLAG_PATH}"$'\n'
+  out+="GATE_MSG"$'\n'
+  out+="exit 2"$'\n'
+  printf '%s' "$out"
+}
+
+# ----------------------------------------------------------------------------
+# write / dry-run
+# ----------------------------------------------------------------------------
+write_file() {
+  local path="$1"; local contents="$2"; local mode="${3:-0644}"
+  if $DRY_RUN; then
+    echo "=== DRY-RUN: would write $path ==="
+    printf '%s\n' "$contents" | head -10
+    echo "    ... ($(printf '%s\n' "$contents" | wc -l) lines)"
+    echo
+  else
+    mkdir -p "$(dirname "$path")"
+    printf '%s\n' "$contents" > "$path"
+    chmod "$mode" "$path"
+    echo "wrote $path"
+  fi
+}
+
+write_file "$MEMORY_FILE" "$(render_memory)"
+write_file "$SKILL_FILE"  "$(render_skill)"
+write_file "$HOOK_FILE"   "$(render_hook)" "0755"
+
+# ----------------------------------------------------------------------------
+# patch settings.json (idempotent — refuses if matcher+command already exists)
+# ----------------------------------------------------------------------------
+if ! $SKIP_SETTINGS && [[ -f "$SETTINGS_FILE" ]]; then
+  if $DRY_RUN; then
+    echo "=== DRY-RUN: would patch $SETTINGS_FILE ==="
+    echo "    add PreToolUse entry { matcher: '$MATCHER_PIPE', command: '$HOOK_FILE' }"
+    echo
+  else
+    # Skip if the exact hook command is already wired anywhere in PreToolUse.
+    if jq -e --arg cmd "$HOOK_FILE" '
+      [.hooks.PreToolUse // [] | .[]?.hooks // [] | .[]?.command] | any(. == $cmd)
+    ' "$SETTINGS_FILE" > /dev/null; then
+      echo "skip $SETTINGS_FILE: hook $HOOK_FILE already wired"
+    else
+      tmp=$(mktemp)
+      jq --arg matcher "$MATCHER_PIPE" --arg cmd "$HOOK_FILE" '
+        .hooks.PreToolUse += [{
+          matcher: $matcher,
+          hooks: [{ type: "command", command: $cmd, timeout: 10 }]
+        }]
+      ' "$SETTINGS_FILE" > "$tmp"
+      # Validate before overwriting.
+      if jq . "$tmp" > /dev/null; then
+        cp "$SETTINGS_FILE" "${SETTINGS_FILE}.bak.$(date +%s 2>/dev/null || echo bk)"
+        mv "$tmp" "$SETTINGS_FILE"
+        echo "patched $SETTINGS_FILE (backup at ${SETTINGS_FILE}.bak.*)"
+      else
+        rm -f "$tmp"
+        echo "ERROR: jq patch produced invalid JSON; settings.json unchanged" >&2
+        exit 1
+      fi
+    fi
+  fi
+elif $SKIP_SETTINGS; then
+  echo "skip settings.json (--skip-settings)"
+fi
+
+# ----------------------------------------------------------------------------
+# update MEMORY.md index
+# ----------------------------------------------------------------------------
+if ! $SKIP_MEMORY_INDEX && [[ -f "$MEMORY_INDEX" ]]; then
+  TITLE="$(printf '%s' "${NAME:0:1}" | tr '[:lower:]' '[:upper:]')${NAME:1}"
+  ENTRY="- [${TITLE}](feedback_${NAME//-/_}.md) — ${DESC}"
+  if grep -qF "feedback_${NAME//-/_}.md" "$MEMORY_INDEX"; then
+    echo "skip $MEMORY_INDEX: entry already present"
+  elif $DRY_RUN; then
+    echo "=== DRY-RUN: would append to $MEMORY_INDEX ==="
+    echo "    $ENTRY"
+    echo
+  else
+    printf '\n%s\n' "$ENTRY" >> "$MEMORY_INDEX"
+    echo "appended to $MEMORY_INDEX"
+  fi
+elif $SKIP_MEMORY_INDEX; then
+  echo "skip MEMORY.md (--skip-memory-index)"
+fi
+
+# ----------------------------------------------------------------------------
+# syntax check the hook
+# ----------------------------------------------------------------------------
+if ! $DRY_RUN && [[ -f "$HOOK_FILE" ]]; then
+  if bash -n "$HOOK_FILE" 2>/dev/null; then
+    echo "syntax OK: $HOOK_FILE"
+  else
+    echo "WARN: $HOOK_FILE failed syntax check" >&2
+    bash -n "$HOOK_FILE" 2>&1 | sed 's/^/  /' >&2
+  fi
+fi
+
+# ----------------------------------------------------------------------------
+# summary
+# ----------------------------------------------------------------------------
+if $DRY_RUN; then
+  echo
+  echo "DRY-RUN complete. Re-run without --dry-run to write."
+else
+  cat <<SUM
+
+Built gate '${NAME}':
+  memory rule : ${MEMORY_FILE}
+  skill       : ${SKILL_FILE}
+  hook        : ${HOOK_FILE}
+  flag path   : ${FLAG_PATH}
+  matcher     : ${MATCHER_PIPE}
+
+Next steps:
+  1. Open ${SKILL_FILE} and replace the <placeholder> sections with the actual skill logic.
+  2. Edit ${MEMORY_FILE} to expand the scope/exclusions sections.
+  3. Restart Claude Code (or wait for next session) so the new hook is picked up
+     and the skill appears in the available-skills list.
+  4. Smoke-test: trigger one of the gated tools; the hook should block with the
+     remediation message. Invoke /${NAME}, the send should pass.
+SUM
+fi
