@@ -43,51 +43,74 @@ GH="${WATCH_PR_GH:-gh}"
 DEFAULT_BOTS="github-actions,supabase,dependabot,renovate,vercel,coderabbitai,netlify,cloudflare-workers-and-pages,copilot-pull-request-reviewer"
 AUTOMATION_BOTS="${WATCH_PR_AUTOMATION_BOTS:-$DEFAULT_BOTS}"
 
+# Sentinel a signal returns when its gh/API call fails (e.g. a transient 401).
+# The poll loop treats it as "couldn't read — skip this poll" rather than
+# diffing a leaked error body (a 401 body once looked like a new review thread).
+# Each signal captures gh's output and, on a non-zero exit, returns the sentinel
+# instead of the (leaked-to-stdout) error JSON.
+ERR="__ERR__"
+
 # Aggregate CI state across ALL checks:
 #   pending - no checks yet, or any check still pending/in-progress
 #   fail    - all checks terminal AND at least one failed/cancelled
 #   pass    - all checks terminal and none failed (skipped/neutral is fine)
+# gh pr checks' exit code is overloaded (8=pending, 1=failing), so VALIDATE the
+# output shape instead of trusting the exit code: a clean read is one token;
+# anything else (empty, a leaked error body) is treated as a failed read.
 ci_state() {
-  "$GH" pr checks "$PR" --repo "$REPO" --json bucket --jq '
+  local out
+  out=$("$GH" pr checks "$PR" --repo "$REPO" --json bucket --jq '
     [.[].bucket] as $b
     | if (($b | length) == 0) then "pending"
       elif ($b | map(. == "pending") | any) then "pending"
       elif ($b | map(. == "fail" or . == "cancel") | any) then "fail"
-      else "pass" end' 2>/dev/null
+      else "pass" end' 2>/dev/null)
+  case "$out" in
+    pending|pass|fail) printf '%s' "$out" ;;
+    *) printf '%s' "$ERR" ;;
+  esac
 }
 
 unresolved_threads() {
-  "$GH" api graphql -f query='
+  local out
+  out=$("$GH" api graphql -f query='
     { repository(owner: "'"$OWNER"'", name: "'"$NAME"'") {
         pullRequest(number: '"$PR"') {
           reviewThreads(first: 100) { nodes { id isResolved } } } } }' \
     --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
-           | select(.isResolved==false) | .id] | sort | join(",")' 2>/dev/null
+           | select(.isResolved==false) | .id] | sort | join(",")' 2>/dev/null) || { printf '%s' "$ERR"; return; }
+  printf '%s' "$out"
 }
 
 review_decision() {
-  "$GH" pr view "$PR" --repo "$REPO" --json reviewDecision --jq '.reviewDecision // ""' 2>/dev/null
+  local out
+  out=$("$GH" pr view "$PR" --repo "$REPO" --json reviewDecision --jq '.reviewDecision // ""' 2>/dev/null) || { printf '%s' "$ERR"; return; }
+  printf '%s' "$out"
 }
 
 # Merge state — returns "unknown" if GitHub hasn't computed yet (don't fire
 # on UNKNOWN, wait for the next poll).
 merge_state() {
-  "$GH" pr view "$PR" --repo "$REPO" --json mergeable,mergeStateStatus --jq '
+  local out
+  out=$("$GH" pr view "$PR" --repo "$REPO" --json mergeable,mergeStateStatus --jq '
     .mergeable as $m | .mergeStateStatus as $s
     | if ($m == "UNKNOWN" or $s == "UNKNOWN") then "unknown"
       elif ($m == false or $s == "CONFLICTING" or $s == "DIRTY") then "conflicting"
       elif ($s == "BEHIND") then "behind"
       elif ($s == "BLOCKED") then "blocked"
       elif ($s == "CLEAN" or $s == "UNSTABLE") then "clean"
-      else "other" end' 2>/dev/null
+      else "other" end' 2>/dev/null) || { printf '%s' "$ERR"; return; }
+  printf '%s' "$out"
 }
 
 # Issue-level comments — returns "id|login,id|login,..." with [bot] suffix
-# stripped from the login. Empty string on failure.
+# stripped from the login.
 issue_comments() {
-  "$GH" api "repos/$OWNER/$NAME/issues/$PR/comments" --jq '
+  local out
+  out=$("$GH" api "repos/$OWNER/$NAME/issues/$PR/comments" --jq '
     [.[] | "\(.id)|\((.user.login // "") | sub("\\[bot\\]$"; ""))"] | join(",")
-  ' 2>/dev/null
+  ' 2>/dev/null) || { printf '%s' "$ERR"; return; }
+  printf '%s' "$out"
 }
 
 # Is $1 (login) in the comma-separated automation bot list?
@@ -125,11 +148,20 @@ has_new_thread() {  # any id in $2 (now) that is not in $1 (baseline)
   return 1
 }
 
-BASE_CI=$(ci_state)
-BASE_THREADS=$(unresolved_threads)
-BASE_DECISION=$(review_decision)
-BASE_MERGE=$(merge_state)
-BASE_COMMENTS=$(issue_comments)
+# Capture a clean baseline — a transient API error at startup would otherwise
+# poison every later comparison. Retry a few times before settling for it.
+for _attempt in 1 2 3; do
+  BASE_CI=$(ci_state)
+  BASE_THREADS=$(unresolved_threads)
+  BASE_DECISION=$(review_decision)
+  BASE_MERGE=$(merge_state)
+  BASE_COMMENTS=$(issue_comments)
+  if [ "$BASE_CI" != "$ERR" ] && [ "$BASE_THREADS" != "$ERR" ] && [ "$BASE_DECISION" != "$ERR" ] \
+     && [ "$BASE_MERGE" != "$ERR" ] && [ "$BASE_COMMENTS" != "$ERR" ]; then
+    break
+  fi
+  sleep "$POLL"
+done
 echo "[watch-pr] #$PR baseline: ci='${BASE_CI:-?}' merge='${BASE_MERGE:-?}' decision='${BASE_DECISION:-}' unresolved=[${BASE_THREADS}] comments=$(echo "$BASE_COMMENTS" | awk -F, '{print NF}')" >&2
 
 for ((i=1; i<=MAX; i++)); do
@@ -139,6 +171,14 @@ for ((i=1; i<=MAX; i++)); do
   CUR_DECISION=$(review_decision)
   CUR_MERGE=$(merge_state)
   CUR_COMMENTS=$(issue_comments)
+
+  # A transient gh/API failure (e.g. 401) surfaces as the __ERR__ sentinel on
+  # one or more signals. Skip the whole poll rather than diffing a partial /
+  # leaked read against the baseline; retry on the next tick.
+  if [ "$CUR_CI" = "$ERR" ] || [ "$CUR_THREADS" = "$ERR" ] || [ "$CUR_DECISION" = "$ERR" ] \
+     || [ "$CUR_MERGE" = "$ERR" ] || [ "$CUR_COMMENTS" = "$ERR" ]; then
+    continue
+  fi
 
   REASON=""
   # CI resolved (left pending for a terminal pass/fail).

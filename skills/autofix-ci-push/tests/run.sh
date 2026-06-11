@@ -38,7 +38,17 @@ CF="$stub.counter.\$CHANNEL"
 [ -f "\$CF" ] || echo 0 > "\$CF"
 N=\$(cat "\$CF"); echo \$((N+1)) > "\$CF"
 F="$fixtures/\$CHANNEL.\$N"
-if [ -f "\$F" ]; then cat "\$F"; else echo ""; fi
+if [ -f "\$F" ]; then
+  if [ "\$(cat "\$F")" = "__FAIL__" ]; then
+    # Simulate a transient gh/API failure: error body on stdout, non-zero exit
+    # (mirrors a real 401 — the body that previously leaked into the signal).
+    echo '{"message":"Requires authentication","status":"401"}'
+    exit 1
+  fi
+  cat "\$F"
+else
+  echo ""
+fi
 EOF
   chmod +x "$stub"
 }
@@ -164,6 +174,24 @@ test_default_bots_overridden() {
     || fail "$name: env override should narrow allowlist — $out"
 }
 
+# ── Test 11: a transient API error mid-poll skips the poll (no false fire) ──
+# Regression for the 401 that leaked into unresolved_threads and fired a phantom
+# "new-review-thread". Poll 1's threads call fails (simulated 401); the watcher
+# must skip the poll and end IDLE, not fire.
+test_transient_error_no_false_fire() {
+  local name="$1"; local fx="$TMP/$name/fx"; mkdir -p "$fx"
+  local stub="$TMP/$name/gh"; make_stub "$stub" "$fx"
+  write_cycle "$fx" 0 "pass" "" "REVIEW_REQUIRED" "blocked" ""
+  printf '%s\n' "pass"            > "$fx/ci.1"
+  printf '%s\n' "__FAIL__"        > "$fx/threads.1"
+  printf '%s\n' "REVIEW_REQUIRED" > "$fx/decision.1"
+  printf '%s\n' "blocked"         > "$fx/merge.1"
+  printf '%s\n' ""                > "$fx/comments.1"
+  out=$(WATCH_PR_GH="$stub" "$WATCH" 1 owner/repo 1 2 2>&1)
+  echo "$out" | grep -q "WATCH-PR IDLE" && ok "$name" \
+    || fail "$name: transient error must skip the poll, not fire — $out"
+}
+
 echo "Running watch-pr.sh tests…"
 test_idle                    "1 baseline-no-change-idle"
 test_ci_fires                "2 ci-pending-to-fail-fires"
@@ -175,6 +203,7 @@ test_unknown_merge_silent    "7 unknown-merge-silent"
 test_decision_fires          "8 review-decision-fires"
 test_custom_bot_list         "9 custom-bot-list-filters"
 test_default_bots_overridden "10 env-override-narrows-allowlist"
+test_transient_error_no_false_fire "11 transient-api-error-skips-poll"
 
 echo
 echo "watch-pr.sh tests: PASS=$PASS FAIL=$FAIL"
