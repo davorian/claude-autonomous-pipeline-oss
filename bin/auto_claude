@@ -85,6 +85,13 @@ FRESH_REVIEW_PREAMBLE=""
 FRESH_REVIEW_EXTRAS=""
 DOC_UPDATE_CONTEXT=""
 
+# Empirical finding gate (CAP-EFG-001) — see docs/empirical_finding_gate.md.
+# Forces phase_fresh_review to test H/M-severity falsifiable claims before
+# posting them, or downgrade them to questions if testing isn't possible.
+# Loaded into the fresh_review prompt automatically.
+EMPIRICAL_FINDING_GATE_PATH=""        # override docs/empirical_finding_gate.md path
+SKIP_EMPIRICAL_FINDING_GATE=0         # set to 1 to bypass the gate (not recommended)
+
 # File glob patterns — overridable in .auto_claude.conf.
 # TEST_FILE_GLOBS: patterns for test files (used by test audit to detect test changes).
 # SOURCE_FILE_GLOBS: patterns for source files (used by LOC enforcement to find long files).
@@ -4031,6 +4038,40 @@ _files_match_glob() {
   return 1
 }
 
+# Return 0 if any changed file's content matches any of the given regex patterns.
+# Patterns come as a JSON array ["CREATE TABLE", ...] or a bare string (same shape as
+# _files_match_glob). Matching is case-insensitive; deleted/absent files are skipped.
+# Used for content-based routing of review rules and review lenses.
+_content_matches_any() {
+  local patterns_raw="$1"
+  local changed_files="$2"
+
+  local -a patterns=()
+  if [[ "$patterns_raw" == \[* ]]; then
+    while IFS= read -r p; do
+      patterns+=("$p")
+    done < <(echo "$patterns_raw" | tr -d '[]' | tr ',' '\n' | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//' | grep -v '^$')
+  elif [ -n "$patterns_raw" ]; then
+    patterns+=("$patterns_raw")
+  fi
+
+  [ ${#patterns[@]} -eq 0 ] && return 1
+
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    local target="${PROJECT_ROOT}/${file}"
+    [ -f "$target" ] || target="$file"
+    [ -f "$target" ] || continue
+    for pat in "${patterns[@]}"; do
+      if grep -qiE -- "$pat" "$target" 2>/dev/null; then
+        return 0
+      fi
+    done
+  done <<< "$changed_files"
+
+  return 1
+}
+
 # Extract a YAML frontmatter field value from an .mdc file.
 # Usage: _mdc_field "fieldname" < file.mdc
 _mdc_field() {
@@ -4072,16 +4113,27 @@ $(cat "${PROJECT_ROOT}/.cursor/BUGBOT.md")
       local relative_path="${mdc_file#"${PROJECT_ROOT}/"}"
 
       # Extract frontmatter fields
-      local always_apply globs_raw
+      local always_apply globs_raw content_raw
       always_apply=$(cat "$mdc_file" | _mdc_field "alwaysApply")
       globs_raw=$(cat "$mdc_file" | _mdc_field "globs")
+      content_raw=$(cat "$mdc_file" | _mdc_field "contentPatterns")
 
-      # Determine if this rule should be included
+      # Determine if this rule should be included. A rule fires if it is
+      # alwaysApply, OR its globs match a changed path, OR its contentPatterns
+      # match the content of a changed file (content routing catches diffs that
+      # touch a concern — a raw SQL migration, an event schema — regardless of
+      # which path the file happens to live at).
       local include=false
+      local match_reason=""
       if [ "$always_apply" = "true" ]; then
         include=true
+        match_reason="alwaysApply"
       elif _files_match_glob "$globs_raw" "$changed_files"; then
         include=true
+        match_reason="glob match"
+      elif [ -n "$content_raw" ] && _content_matches_any "$content_raw" "$changed_files"; then
+        include=true
+        match_reason="content match"
       fi
 
       if [ "$include" = true ]; then
@@ -4095,7 +4147,7 @@ $(cat "${PROJECT_ROOT}/.cursor/BUGBOT.md")
 #### ${relative_path}
 ${body}
 "
-          log INFO "Loaded review rule: ${relative_path} ($([ "$always_apply" = "true" ] && echo "alwaysApply" || echo "glob match"))"
+          log INFO "Loaded review rule: ${relative_path} (${match_reason})"
           included_count=$((included_count + 1))
         fi
       else
@@ -4120,6 +4172,111 @@ ${org_rules}"
   echo "$rules"
 }
 
+# Load cross-cutting review lenses as a prompt fragment. Lenses are markdown
+# questionnaires with YAML frontmatter (id, label, and a firing predicate:
+# `when: always`, `when_paths: [glob, ...]`, or `when_content: [regex, ...]`;
+# OR-combined, `always` wins). The shipped set lives in docs/review-experts/
+# (three always-on lenses: absence, failure-mode/blast-radius, historical-precedent);
+# a project may add its own in .auto_claude/review-experts/. Fired lenses' bodies are
+# injected into the cold-review prompt with a FIRED/SKIPPED summary so the reviewer
+# knows which are load-bearing. Returns empty if none fire. Mirrors the pattern of
+# _load_repo_review_rules and _load_empirical_finding_gate.
+_load_review_lenses() {
+  local changed_files="$1"
+  local -a dirs=("${SCRIPT_DIR}/../docs/review-experts")
+  [ -d "${PROJECT_ROOT}/.auto_claude/review-experts" ] && dirs+=("${PROJECT_ROOT}/.auto_claude/review-experts")
+
+  local fired="" fired_ids="" skipped_ids=""
+  local dir expert_files ef
+  for dir in "${dirs[@]}"; do
+    [ -d "$dir" ] || continue
+    expert_files=$(find "$dir" -name "*.md" -type f 2>/dev/null | sort || true)
+    while IFS= read -r ef; do
+      [ -z "$ef" ] && continue
+      local id label when when_paths when_content
+      id=$(cat "$ef" | _mdc_field "id")
+      [ -z "$id" ] && id="$(basename "$ef" .md)"
+      label=$(cat "$ef" | _mdc_field "label")
+      when=$(cat "$ef" | _mdc_field "when")
+      when_paths=$(cat "$ef" | _mdc_field "when_paths")
+      when_content=$(cat "$ef" | _mdc_field "when_content")
+
+      local include=false
+      if [ "$when" = "always" ]; then
+        include=true
+      elif [ -n "$when_paths" ] && _files_match_glob "$when_paths" "$changed_files"; then
+        include=true
+      elif [ -n "$when_content" ] && _content_matches_any "$when_content" "$changed_files"; then
+        include=true
+      fi
+
+      if [ "$include" = true ]; then
+        local body
+        body=$(sed -n '/^---$/,/^---$/!p' "$ef" | awk 'NR==1 && /^$/ { next } { print }')
+        fired+="
+#### Lens: ${id}${label:+ — ${label}}
+${body}
+"
+        fired_ids+="${id} "
+      else
+        skipped_ids+="${id} "
+      fi
+    done <<< "$expert_files"
+  done
+
+  if [ -z "$fired_ids" ]; then
+    log INFO "No review lenses fired"
+    return 0
+  fi
+
+  log INFO "Review lenses fired: ${fired_ids}(skipped: ${skipped_ids:-none})"
+  printf '%s\n' "### Review Lenses
+
+These cross-cutting lenses are **load-bearing** for this review. Apply each fired lens's
+questionnaire below. If you judge a fired lens a false positive for this diff, say so
+explicitly in the review body (name the lens and why) — do not silently skip it.
+
+**Fired:** ${fired_ids}
+**Not fired:** ${skipped_ids:-none}
+${fired}"
+}
+
+# Loads the empirical-finding gate (CAP-EFG-001) as a prompt fragment.
+# `phase_fresh_review` injects this so the cold reviewer applies the
+# test-before-claim discipline to every H/M-severity finding it generates.
+# Returns empty if gate is skipped or the file is missing (logged as WARN).
+_load_empirical_finding_gate() {
+  if [ "${SKIP_EMPIRICAL_FINDING_GATE:-0}" = "1" ]; then
+    log INFO "Empirical finding gate skipped (SKIP_EMPIRICAL_FINDING_GATE=1)"
+    return 0
+  fi
+
+  local path="${EMPIRICAL_FINDING_GATE_PATH:-}"
+  if [ -z "$path" ]; then
+    path="${SCRIPT_DIR}/../docs/empirical_finding_gate.md"
+  fi
+
+  if [ ! -f "$path" ]; then
+    log WARN "Empirical finding gate doc missing at ${path} — using minimal fallback"
+    cat <<'EOF'
+
+## Test-before-claim gate (fallback — full doc missing)
+
+For every High-severity finding (and every Medium that makes a falsifiable claim about runtime behaviour):
+
+1. Classify as testable claim vs opinion. Opinions get posted as opinions.
+2. If testable: try to verify (read source / write a 10-30 LOC script / add a regression test).
+3. If verified: post the finding with the test result inline.
+4. If you cannot test it in this session: downgrade the claim to a question, do not post it as a definitive finding.
+
+A confidently-worded testable finding that turns out to be wrong is worse than no finding — it costs the author's time and your credibility on the rest of the review.
+EOF
+    return 0
+  fi
+
+  cat "$path"
+}
+
 phase_fresh_review() {
   local changed_files
   changed_files="$(get_changed_files)"
@@ -4134,6 +4291,12 @@ phase_fresh_review() {
 
   local repo_review_rules
   repo_review_rules=$(_load_repo_review_rules "$changed_files")
+
+  local review_lenses
+  review_lenses=$(_load_review_lenses "$changed_files")
+
+  local empirical_finding_gate
+  empirical_finding_gate=$(_load_empirical_finding_gate)
 
   # Fresh context — the reviewer has never seen this code and evaluates it cold.
   # Context pack deliberately excludes plan_intent to avoid anchoring bias.
@@ -4173,7 +4336,11 @@ ${FRESH_REVIEW_EXTRAS:+${FRESH_REVIEW_EXTRAS}
    - Injection risks in queries?
    - Unvalidated user input?
 
-Output a review in this format:
+${review_lenses:+${review_lenses}
+
+}${empirical_finding_gate:+${empirical_finding_gate}
+
+}Output a review in this format:
 
 ## Fresh-Context Review
 
